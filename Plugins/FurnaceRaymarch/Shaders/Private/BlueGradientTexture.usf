@@ -1,0 +1,27 @@
+// BlueGradientTexture.usf — fonctions pour matériau (pas de ScreenPass, pas de SV_Position)
+
+#ifndef FURNACE_BLUE_GRADIENT_TEXTURE_USF
+#define FURNACE_BLUE_GRADIENT_TEXTURE_USF
+
+inline float3 BlueGradientUV(float2 UV)
+{
+    UV = saturate(UV);
+    const float t = UV.y;
+
+    const float3 colLow = float3(0.02, 0.08, 0.25); // bas
+    const float3 colHigh = float3(0.25, 0.75, 1.00); // haut
+    return lerp(colLow, colHigh, t);
+}
+
+// Variante World Space si tes UV ont des coutures
+inline float3 BlueGradientWS(float3 WorldPos, float HeightMin, float HeightMax)
+{
+    const float denom = max(HeightMax - HeightMin, 1e-3);
+    const float t = saturate((WorldPos.z - HeightMin) / denom);
+
+    const float3 colLow = float3(0.02, 0.08, 0.25);
+    const float3 colHigh = float3(0.25, 0.75, 1.00);
+    return lerp(colLow, colHigh, t);
+}
+
+#endif // FURNACE_BLUE_GRADIENT_TEXTURE_USF

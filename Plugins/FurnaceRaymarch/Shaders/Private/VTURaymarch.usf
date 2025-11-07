@@ -1,0 +1,208 @@
+#include "/Engine/Private/Common.ush"
+
+// === Sortie ===
+RWTexture2D<float4> OutTex;
+
+// === Ecran ===
+uint2 RTSize;
+uint RTWidth;
+uint RTHeight;
+
+// === Caméra ===
+float4x4 InvViewProj;
+
+// === Compat (non utilisés ici) ===
+float4x4 WorldToLocal;
+float4 ClipPlaneWS;
+uint UseClip;
+uint Pad0, Pad1, Pad2;
+
+// === AABB MONDE ===
+float4 UnionMinLS4; // MinWS
+float4 UnionMaxLS4; // MaxWS
+
+// === SRV VTU ===
+StructuredBuffer<float3> Points;
+StructuredBuffer<uint> Conn;
+StructuredBuffer<uint> Offs;
+StructuredBuffer<uint> Types;
+StructuredBuffer<float> FeatureVals;
+uint NumPoints;
+uint NumCells;
+
+// ---- util AABB slab ----
+bool RayBox(float3 ro, float3 rd, float3 c, float3 e, out float t0, out float t1)
+{
+    float3 inv = 1.0 / max(abs(rd), 1e-6);
+    float3 t1v = ((c - e) - ro) * inv;
+    float3 t2v = ((c + e) - ro) * inv;
+    float3 tmin3 = min(t1v, t2v);
+    float3 tmax3 = max(t1v, t2v);
+    t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+    t1 = min(min(tmax3.x, tmax3.y), tmax3.z);
+    return t1 > max(t0, 0.0);
+}
+
+// Faces VTK hexa (ordre standard VTK: 0..7)
+static const uint4 HEX_Q[6] =
+{
+    uint4(0, 1, 3, 2), // Z-
+    uint4(4, 5, 7, 6), // Z+
+    uint4(0, 1, 5, 4), // -Y
+    uint4(1, 2, 6, 5), // +X
+    uint4(2, 3, 7, 6), // +Y
+    uint4(3, 0, 4, 7) // -X
+};
+
+// --- Ray / convex-poly clipping (exact HEX). Robust to face winding by flipping normals toward outside ---
+bool IntersectHEX_FirstT(float3 ro, float3 rd, float3 v[8], out float tHit, out float3 nHit)
+{
+    // centre "intérieur" pour orienter correctement les normales de face
+    float3 cc = (v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7]) * (1.0 / 8.0);
+
+    float t0 = -1e9, t1 = 1e9;
+    float3 nEnter = float3(0, 0, 1);
+
+    [unroll]
+    for (int f = 0; f < 6; ++f)
+    {
+        float3 a = v[HEX_Q[f].x];
+        float3 b = v[HEX_Q[f].y];
+        float3 c = v[HEX_Q[f].z];
+
+        float3 n = cross(b - a, c - a);
+        float nl = length(n);
+        if (nl < 1e-10)
+            continue; // face dégénérée -> ignore (hexa valide n'a pas ce cas)
+        n /= nl;
+
+        float d = dot(n, a);
+
+        // Assure que l'intérieur satisfait n*x <= d (si cc est dedans, il doit vérifier)
+        if (dot(n, cc) > d)
+        {
+            n = -n;
+            d = -d;
+        }
+
+        float denom = dot(n, rd);
+        float numer = d - dot(n, ro);
+
+        if (abs(denom) < 1e-8)
+        {
+            // Ray parallèle: s'il est hors de l'half-space, rejet
+            if (numer < 0)
+                return false;
+            // sinon, pas de contrainte
+            continue;
+        }
+
+        float tplane = numer / denom;
+
+        // n*rd > 0 : on quitte, contraint t1 ; n*rd < 0 : on entre, contraint t0
+        if (denom > 0)
+        {
+            t1 = min(t1, tplane);
+        }
+        else
+        {
+            if (tplane > t0)
+            {
+                t0 = tplane;
+                nEnter = n;
+            }
+        }
+
+        if (t0 > t1)
+            return false; // pas d'intersection
+    }
+
+    if (t1 < 0)
+        return false; // tout derrière
+    tHit = (t0 >= 0) ? t0 : t1;
+    nHit = nEnter;
+    return true;
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    if (DTid.x >= RTWidth || DTid.y >= RTHeight)
+        return;
+
+    // Rayon monde via InvViewProj
+    float2 uv = (DTid.xy + 0.5) / float2(RTWidth, RTHeight);
+    float2 ndc = uv * 2.0 - 1.0;
+
+    float4 pNear = mul(InvViewProj, float4(ndc, 0, 1));
+    float4 pFar = mul(InvViewProj, float4(ndc, 1, 1));
+    pNear.xyz /= max(pNear.w, 1e-6);
+    pFar.xyz /= max(pFar.w, 1e-6);
+
+    float3 roWS = pNear.xyz;
+    float3 rdWS = normalize(pFar.xyz - pNear.xyz);
+
+    // AABB globale (monde)
+    float3 bminWS = UnionMinLS4.xyz;
+    float3 bmaxWS = UnionMaxLS4.xyz;
+    float3 cWS = 0.5 * (bminWS + bmaxWS);
+    float3 eWS = 0.5 * abs(bmaxWS - bminWS);
+
+    float t0g, t1g;
+    if (!RayBox(roWS, rdWS, cWS, eWS, t0g, t1g))
+    {
+        OutTex[DTid.xy] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    // Fallback: dégradé UVW de la box globale
+    float3 hitG = roWS + rdWS * max(t0g, 0.0);
+    float3 col = saturate((hitG - bminWS) / max(bmaxWS - bminWS, 1e-6));
+    float a = 1.0;
+
+    // Exact HEX sur la première cellule si dispo
+    if (NumCells > 0)
+    {
+        uint end0 = Offs[0];
+        uint start0 = 0;
+        uint n0 = end0 - start0;
+
+        if (Types[0] == 12u && n0 == 8u) // VTK_HEXAHEDRON
+        {
+            uint i0 = Conn[start0 + 0], i1 = Conn[start0 + 1], i2 = Conn[start0 + 2], i3 = Conn[start0 + 3];
+            uint i4 = Conn[start0 + 4], i5 = Conn[start0 + 5], i6 = Conn[start0 + 6], i7 = Conn[start0 + 7];
+
+            bool ok = (i0 < NumPoints) && (i1 < NumPoints) && (i2 < NumPoints) && (i3 < NumPoints)
+                   && (i4 < NumPoints) && (i5 < NumPoints) && (i6 < NumPoints) && (i7 < NumPoints);
+
+            if (ok)
+            {
+                float3 v[8];
+                v[0] = Points[i0];
+                v[1] = Points[i1];
+                v[2] = Points[i2];
+                v[3] = Points[i3];
+                v[4] = Points[i4];
+                v[5] = Points[i5];
+                v[6] = Points[i6];
+                v[7] = Points[i7];
+
+                // On clip d'abord avec l'AABB globale pour ne pas faire de tests hors zone
+                float tA0, tA1;
+                if (RayBox(roWS, rdWS, cWS, eWS, tA0, tA1))
+                {
+                    float tHit;
+                    float3 nHit;
+                    if (IntersectHEX_FirstT(roWS, rdWS, v, tHit, nHit))
+                    {
+                        float3 N = normalize(nHit);
+                        col = saturate(0.5 * (N + 1.0)); // normal->couleur
+                        a = 1.0;
+                    }
+                }
+            }
+        }
+    }
+
+    OutTex[DTid.xy] = float4(col, a);
+}
