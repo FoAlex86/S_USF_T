@@ -1545,12 +1545,7 @@ static uint32 GetTypeHash(const FFaceKey& K)
   return h;
 }
 
-bool VTUCore::BuildSurfaceToPMC_WithCellScalars(const FVTUGrid& G,
-                                                UProceduralMeshComponent* PMC,
-                                                float ScaleCm,
-                                                const TArray<float>& CellScalars,
-                                                float VMin, float VMax,
-                                                int32 SectionIndex)
+bool VTUCore::BuildSurfaceToPMC_WithCellScalars(const FVTUGrid& G, UProceduralMeshComponent* PMC, float ScaleCm, const TArray<float>& CellScalars, float VMin, float VMax, int32 SectionIndex)
 {
   if (!PMC) return false;
   if (!G.HasPolyFaces()) {

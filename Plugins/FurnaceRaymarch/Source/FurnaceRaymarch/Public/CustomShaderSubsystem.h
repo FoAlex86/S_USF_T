@@ -3,6 +3,7 @@
 
 #include "CoreMinimal.h"
 #include "VTU/VTUCore.h"
+#include "VTU/VTUOctree.h"
 #include "Subsystems/EngineSubsystem.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Rendering/CustomSceneViewExtension.h"
@@ -19,6 +20,9 @@ private:
 	
 	UPROPERTY()                 // (garbage collector)
 	UTextureRenderTarget2D* RaymarchRT = nullptr;
+
+	int32 DebugDrawMode_GT = 0; // côté GameThread, pour le Cycle
+
 public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
@@ -33,17 +37,37 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "VTU")
 	void ClearVTUOnGPU();
 
-	UFUNCTION(BlueprintCallable, Category = "FurnaceRaymarch")
-	void UploadDummyVTU();
-
 	UFUNCTION(BlueprintCallable, Category = "VTU")
 	void SetRaymarchVolumeTransform(const FTransform& ActorToWorld);
 
 	UFUNCTION(BlueprintCallable, Category = "VTU")
-	void SetRaymarchBoundsWS(const FVector& MinWS, const FVector& MaxWS);
+	/*void SetRaymarchBoundsWS(const FVector& MinWS, const FVector& MaxWS);*/
+	void SetRaymarchBoundsLS(const FVector& MinLS, const FVector& MaxLS);
+
+	UFUNCTION(BlueprintCallable, Category = "VTU")
+	void SetWorldToLocal(const FMatrix& W2L);
+
+	UFUNCTION(BlueprintCallable, Category = "VTU")
+	bool UploadFeatureVals(const TArray<float>& Values);
+
+	UFUNCTION(BlueprintCallable, Category = "VTU")
+	void SetFeatureWindow(float InVMin, float InVMax);
+
+	UFUNCTION(BlueprintCallable, Category = "VTU")
+	void SetRaymarchEpsilon(float InEpsCm);
 
 	// --- C++ pur (prend le vrai FVTUGrid) ---
 	bool UploadVTUGrid(const FVTUGrid& Grid, float ScaleCm = 1.f);
+
+	bool UploadVTUOctree(const FVTUCellOctree& Octree);
+
+	// Set explicite depuis Blueprint (0..2)
+	UFUNCTION(BlueprintCallable, Category = "VTU|Debug")
+	void SetDebugDrawMode(int32 Mode);
+
+	// Cycle 0 -> 1 -> 2 -> 0
+	UFUNCTION(BlueprintCallable, Category = "VTU|Debug")
+	void CycleDebugDrawMode();
 
 	//// Option: fixe l’AABB de debug (monde) utilisé par l’USF pour l’overlay/UVW
 	//UFUNCTION(BlueprintCallable, Category = "VTU")

@@ -17,18 +17,23 @@
 // ------------------------------------------------------------------
 // Construction / liaison de la RenderTarget
 // ------------------------------------------------------------------
-
+// Extension enregistrée
 FCustomSceneViewExtension::FCustomSceneViewExtension(const FAutoRegister& AutoRegister)
 	: FSceneViewExtensionBase(AutoRegister)
 {
 }
 
+// Stocke uniquement l’UObject de la RT (côté GT). La ressource RHI est récupérée plus tard sur le Render Thread (dans PrePostProcessPass_RenderThread)
 void FCustomSceneViewExtension::SetRaymarchTargetObject(UTextureRenderTarget2D* InRT)
 {
 	// Stocke juste l’objet ; on touchera la ressource côté Render Thread
 	RaymarchRT_Object = InRT;
 }
 
+// ------------------------------------------------------------------
+// post-process : on prépare/dispatch le compute et on copie vers la RT.
+// C'est exécuté sur le Render Thread, dans le Render Graph.
+// ------------------------------------------------------------------
 void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 	FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessingInputs& Inputs)
 {
@@ -36,19 +41,19 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 	UTextureRenderTarget2D* RTObj = RaymarchRT_Object.Get();
 	if (!RTObj)
 	{
-		return;
+		return; // pas de cible = on ne fait rien ce frame
 	}
 
 	FTextureRenderTargetResource* RTRes = RTObj->GetRenderTargetResource();
 	if (!RTRes || !RTRes->IsInitialized())
 	{
-		return;
+		return; // RT non initialisée
 	}
 
 	FTextureRHIRef RHITexture = RTRes->GetRenderTargetTexture();
 	if (!RHITexture.IsValid())
 	{
-		return;
+		return; // ressource RHI absente
 	}
 
 	// 1) Expose la RT externe au Render Graph (destination du copy)
@@ -61,52 +66,57 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 	// 2) Crée une texture RDG INTERNE avec flag UAV
 	//    PF_FloatRGBA correspond à RTF_RGBA16f.
 	FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
-		SizeXY,                        // FIntPoint
-		PF_FloatRGBA,                  // EPixelFormat (match RTF_RGBA16f)
+		SizeXY,                        // dimensions
+		PF_FloatRGBA,                  // format (float16 RGBA)
 		FClearValueBinding::Transparent,
-		TexCreate_ShaderResource | TexCreate_UAV   // <-- 4e arg obligatoire
+		TexCreate_ShaderResource | TexCreate_UAV   // nécessaire pour UAV
 	);
 	FRDGTextureRef RDGInternal = GraphBuilder.CreateTexture(Desc, TEXT("FurnaceRaymarch_Internal"));
 
-	 //3) Paramètres du compute : UAV = texture interne (PAS la RT externe)
+	// 3) Alloue et remplit la structure de paramètres du compute
 	FVTURaymarchCS::FParameters* Params = GraphBuilder.AllocParameters<FVTURaymarchCS::FParameters>();
+	// --- Sortie UAV : on bind l’UAV de la texture interne, PAS la RT externe.
 	Params->OutTex = GraphBuilder.CreateUAV(RDGInternal);
-	Params->RTSize = FUintVector2((uint32)SizeXY.X, (uint32)SizeXY.Y);
 
+	//==========================================================================================================
 	// Taille écran/RT
+	Params->RTSize = FUintVector2((uint32)SizeXY.X, (uint32)SizeXY.Y);
 	Params->RTWidth = (uint32)SizeXY.X;
 	Params->RTHeight = (uint32)SizeXY.Y;
 
-	// InvViewProj (éviter le jitter si possible)
+	// --- Matrices caméra : inverse ViewProj pour reconstruire rayons VS/WS si besoin.
 	Params->InvViewProj = FMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix());
 
-	// Objet & clip
+	// --- Position caméra en monde : pour encoder la profondeur relative en alpha.
+	Params->CameraPosWS = (FVector3f)View.ViewMatrices.GetViewOrigin();
+
+	// --- Clip plane (désactivé par défaut, champs padding à 0).
 	Params->ClipPlaneWS = FVector4f(0, 0, 0, 0);
 	Params->UseClip = 0;
 	Params->Pad0 = Params->Pad1 = Params->Pad2 = 0;
 
-	// === WorldToLocal & AABB monde venant des setters ===
-	// (si non fournis, fallback: petite box devant la caméra)
+	// --- WorldToLocal du volume (défini via setters ; sinon identité).
+	//     Sert à passer de WS -> LS (espace local du proxy box pour raymarch).
 	Params->WorldToLocal = bHasWorldToLocal ? WorldToLocal_RT : FMatrix44f::Identity;
 
-	if (bHasDebugBounds)
+	// --- AABB locale d’union (par ex. union des clones ou le 1/8 de base)
+	//     Si non fourni, fallback sur petit cube [-1..1] en LS.
+	if (bHasBoundsLS)
 	{
-		Params->UnionMinLS4 = FVector4f(DebugMinWS, 0.f);
-		Params->UnionMaxLS4 = FVector4f(DebugMaxWS, 0.f);
+		Params->UnionMinLS4 = FVector4f(BoundsMinLS, 0.f);
+		Params->UnionMaxLS4 = FVector4f(BoundsMaxLS, 0.f);
 	}
 	else
 	{
-		const FMatrix InvView = View.ViewMatrices.GetInvViewMatrix();
-		const FVector FwdWS = InvView.GetUnitAxis(EAxis::X);
-		const FVector3f CenterWS = (FVector3f)(View.ViewMatrices.GetViewOrigin() + 50.f * FwdWS);
-		const FVector3f ExtentWS(50.f, 50.f, 50.f);
-		Params->UnionMinLS4 = FVector4f(CenterWS - ExtentWS, 0.f);
-		Params->UnionMaxLS4 = FVector4f(CenterWS + ExtentWS, 0.f);
+		//// mini fallback local (petit cube au centre local)
+		Params->UnionMinLS4 = FVector4f(-1, -1, -1, 0);
+		Params->UnionMaxLS4 = FVector4f(1, 1, 1, 0);
 	}
 
 
-	// =================================================SRV======================================================
-	// 1) Fallback SRV structuré 4 octets (créé une seule fois)
+	// ================================================= SRV / FALLBACK ==================================================
+	// 1) SRV de repli (buffer structuré 4 octets) : alloué une seule fois.
+	//    Permet d’éviter d’avoir des SRV null quand certaines ressources ne sont pas encore uploadées.
 	static FBufferRHIRef               GNullBuffer;
 	static FShaderResourceViewRHIRef   GNullSRV;
 
@@ -133,13 +143,14 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 		GNullSRV = RHICmdList.CreateShaderResourceView(GNullBuffer);
 	}
 
-	// 2) Helpers pour piocher une SRV valide ou fallback
+	// 2) Helper pour choisir entre SRV valide et fallback
 	auto PickSRV = [&](const FShaderResourceViewRHIRef& SRV) -> FShaderResourceViewRHIRef
-		{
-			return SRV.IsValid() ? SRV : GNullSRV;
-		};
+	{
+		return SRV.IsValid() ? SRV : GNullSRV;
+	};
 
-	// 3) Assigner TOUJOURS des SRV non-null aux paramètres shader
+	// ==== Initialisation par défaut (fallback) pour tous les SRV ====
+	// Grille VTU
 	Params->Points = GNullSRV;
 	Params->Conn = GNullSRV;
 	Params->Offs = GNullSRV;
@@ -148,38 +159,91 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 	Params->NumPoints = 0;
 	Params->NumCells = 0;
 
+	// ==== Octree & éléments ====
+	Params->OctNodeCenter = GNullSRV;
+	Params->OctNodeExtent = GNullSRV;
+	Params->OctNodeFirstChild = GNullSRV;
+	Params->OctNodeChildCount = GNullSRV;
+	Params->OctNodeFirstElem = GNullSRV;
+	Params->OctNodeElemCount = GNullSRV;
+
+	Params->NodeChildIndex = GNullSRV;
+
+	Params->ElemMin = GNullSRV;
+	Params->ElemMax = GNullSRV;
+	Params->ElemCell = GNullSRV;
+
+	Params->NumNodes = 0;
+	Params->NumElems = 0;
+	Params->RootIndex = 0;
+
+	// Shading/feature par défaut
+	Params->UseFeatureVals = 0;
+	Params->VMin = 0.55f;
+	Params->VMax = 1.2f;
+	Params->EpsCm = 0.15f;
+
+	// Si on a reçu un "resource patch" (GPUResBA) auparavant, on remplace les SRV/compteurs par les vrais.
 	if (bHasGPUResBA)
 	{
+		// VTU
 		Params->Points = PickSRV(GPUResBA.PointsSRV);
 		Params->Conn = PickSRV(GPUResBA.ConnSRV);
 		Params->Offs = PickSRV(GPUResBA.OffsSRV);
 		Params->Types = PickSRV(GPUResBA.TypesSRV);
 		Params->FeatureVals = PickSRV(GPUResBA.FeatureValsSRV);
+		Params->Faces = PickSRV(GPUResBA.FacesSRV);
+		Params->FaceOffsets = PickSRV(GPUResBA.FaceOffsetsSRV);
 
 		Params->NumPoints = GPUResBA.NumPoints;
 		Params->NumCells = GPUResBA.NumCells;
+
+		// Octree
+		Params->OctNodeCenter = PickSRV(GPUResBA.OctNodeCenterSRV);
+		Params->OctNodeExtent = PickSRV(GPUResBA.OctNodeExtentSRV);
+		Params->OctNodeFirstChild = PickSRV(GPUResBA.OctNodeFirstChildSRV);
+		Params->OctNodeChildCount = PickSRV(GPUResBA.OctNodeChildCountSRV);
+		Params->OctNodeFirstElem = PickSRV(GPUResBA.OctNodeFirstElemSRV);
+		Params->OctNodeElemCount = PickSRV(GPUResBA.OctNodeElemCountSRV);
+
+		Params->NodeChildIndex = PickSRV(GPUResBA.NodeChildIndexSRV);
+
+		Params->ElemMin = PickSRV(GPUResBA.ElemMinSRV);
+		Params->ElemMax = PickSRV(GPUResBA.ElemMaxSRV);
+		Params->ElemCell = PickSRV(GPUResBA.ElemCellSRV);
+
+		Params->NumNodes = GPUResBA.NumNodes;
+		Params->NumElems = GPUResBA.NumElems;
+		Params->RootIndex = GPUResBA.RootIndex;
+
+		// Modes/debug/échelle valeurs
+		Params->DebugDrawMode = DebugDrawMode_RT;
+		Params->UseFeatureVals = GPUResBA.UseFeatureVals;
+		Params->VMin = GPUResBA.VMin;
+		Params->VMax = GPUResBA.VMax;
+		Params->EpsCm = GPUResBA.EpsCm;
+
+		// logs de contrôle
+		UE_LOG(LogTemp, Warning, TEXT("[Raymarch]  Octree: Nodes=%u Elems=%u Root=%u  (hasGPU=%d)"), Params->NumNodes, Params->NumElems, Params->RootIndex, bHasGPUResBA ? 1 : 0);
+		UE_LOG(LogTemp, Warning, TEXT("[Raymarch] UseFeat=%u FeatSRV=%d VMin=%.3f VMax=%.3f Eps=%.3f"), GPUResBA.UseFeatureVals, GPUResBA.FeatureValsSRV.IsValid() ? 1 : 0, GPUResBA.VMin, GPUResBA.VMax, GPUResBA.EpsCm);
 	}
 
-	// 4) Shader handle
+	// 4) Récupère le shader compute global
 	const FGlobalShaderMap* GSM = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 	TShaderMapRef<FVTURaymarchCS> CS(GSM);
 	const FComputeShaderRHIRef ShaderRHI = CS.GetComputeShader();
 
-	// 5) Group count (numthreads 8x8x1)
-	const FIntVector GroupCount(
-		FMath::DivideAndRoundUp(SizeXY.X, 8),
-		FMath::DivideAndRoundUp(SizeXY.Y, 8),
-		1
-	);
+	// 5) Taille de dispatch (numthreads 8x8x1 dans l’USF) -> nb de groupes
+	const FIntVector GroupCount( FMath::DivideAndRoundUp(SizeXY.X, 8), FMath::DivideAndRoundUp(SizeXY.Y, 8), 1);
 
 	RDG_EVENT_SCOPE(GraphBuilder, "VTURaymarchCS");
 
 	const FVector3f Cam = (FVector3f)View.ViewMatrices.GetViewOrigin();
-	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] Cam=(%.2f,%.2f,%.2f)  RT=%dx%d"), Cam.X, Cam.Y, Cam.Z, SizeXY.X, SizeXY.Y);
-	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] Bounds Min=(%.2f,%.2f,%.2f) Max=(%.2f,%.2f,%.2f)"), Params->UnionMinLS4.X, Params->UnionMinLS4.Y, Params->UnionMinLS4.Z, Params->UnionMaxLS4.X, Params->UnionMaxLS4.Y, Params->UnionMaxLS4.Z);
+	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] CamWS=(%.2f,%.2f,%.2f)  RT=%dx%d"), Cam.X, Cam.Y, Cam.Z, SizeXY.X, SizeXY.Y);
+	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] BoundsLS Min=(%.2f,%.2f,%.2f) Max=(%.2f,%.2f,%.2f)"), Params->UnionMinLS4.X, Params->UnionMinLS4.Y, Params->UnionMinLS4.Z, Params->UnionMaxLS4.X, Params->UnionMaxLS4.Y, Params->UnionMaxLS4.Z);
 	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] NumPoints=%u  NumCells=%u  (hasGPU=%d)"), Params->NumPoints, Params->NumCells, bHasGPUResBA ? 1 : 0);
 
-	// 6) Pass compute : bind / dispatch / unbind
+	// 6) Ajoute le pass compute au RDG : bind des paramètres, dispatch, unbind des UAV
 	GraphBuilder.AddPass(
 		RDG_EVENT_NAME("VTURaymarchCS_Dispatch"),
 		Params,
@@ -193,12 +257,12 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 				RHICmdList,
 				CS,                          // TShaderRef
 				ShaderRHI.GetReference(),    // FRHIComputeShader*
-				*Params
+				*Params						// bind struct params -> root signature
 			);
 
 			RHICmdList.DispatchComputeShader(GroupCount.X, GroupCount.Y, GroupCount.Z);
 
-			// lifetime :
+			// Nettoyage des UAV bindés 
 			UnsetShaderUAVs(
 				RHICmdList,
 				CS,
@@ -207,34 +271,117 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 		}
 	);
 
-	// 7) Copie la texture interne -> RT externe 
+	// 7) Copie la texture interne (écrite par le compute) vers la RT externe fournie par le gameplay.
 	AddCopyTexturePass(GraphBuilder, RDGInternal, RDGOut);
 }
 
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
-void FCustomSceneViewExtension::SubscribeToPostProcessingPass(
-	EPostProcessingPass Pass, const FSceneView& View,
-	FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled)
-#else
-void FCustomSceneViewExtension::SubscribeToPostProcessingPass(
-	EPostProcessingPass Pass, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled)
-#endif
-{
-	// Intentionnellement vide
-}
-
-FScreenPassTexture FCustomSceneViewExtension::CustomPostProcessFunction(
-	FRDGBuilder& GraphBuilder, const FSceneView& SceneView, const FPostProcessMaterialInputs& Inputs)
+// Extension interface optionnelle : ici, pas d’override de post-process matériel
+FScreenPassTexture FCustomSceneViewExtension::CustomPostProcessFunction(FRDGBuilder& GraphBuilder, const FSceneView& SceneView, const FPostProcessMaterialInputs& Inputs)
 {
 	return FScreenPassTexture();
 }
 
+// ------------------------------------------------------------------
+// Réception / fusion des "resource patches" (SRV/compteurs/params) côté RT.
+// Pousser des morceaux de ressources (grille seule, octree seul, features seuls), et on merge dans un stockage persistant GPUResBA.
+// ------------------------------------------------------------------
 void FCustomSceneViewExtension::SetVTUGPUResources(const FVTUGPUResourcesBA& In)
 {
-	GPUResBA = In;       // copie légère de FBufferRHIRef + counters
-	bHasGPUResBA = (In.PointsSRV.IsValid() || In.ConnSRV.IsValid() || In.OffsSRV.IsValid() || In.TypesSRV.IsValid());
+	// helpers de merge : si le nouveau SRV/Buffer est valide, on remplace l’actuel
+	auto PickSRV = [](const FShaderResourceViewRHIRef& NewSRV, FShaderResourceViewRHIRef& CurSRV)
+	{
+		if (NewSRV.IsValid()) CurSRV = NewSRV;
+	};
+	auto PickBuf = [](const FBufferRHIRef& NewBuf, FBufferRHIRef& CurBuf)
+	{
+		if (NewBuf.IsValid()) CurBuf = NewBuf;
+	};
+
+	// flags pour savoir quel paquet on vient de recevoir
+	const bool HasGridPack =
+		In.PointsSRV.IsValid() || In.ConnSRV.IsValid() || In.OffsSRV.IsValid() ||
+		In.TypesSRV.IsValid() || In.FacesSRV.IsValid() || In.FaceOffsetsSRV.IsValid();
+
+	const bool HasFeatPack = In.FeatureValsSRV.IsValid();
+
+	const bool HasOctPack =
+		In.OctNodeCenterSRV.IsValid() || In.OctNodeExtentSRV.IsValid() ||
+		In.OctNodeFirstChildSRV.IsValid() || In.OctNodeChildCountSRV.IsValid() ||
+		In.OctNodeFirstElemSRV.IsValid() || In.OctNodeElemCountSRV.IsValid() ||
+		In.NodeChildIndexSRV.IsValid() || In.ElemMinSRV.IsValid() ||
+		In.ElemMaxSRV.IsValid() || In.ElemCellSRV.IsValid();
+
+	// ---------------- GRID ---------------- (buffers + SRV + compteurs)
+	PickBuf(In.PointsBuffer, GPUResBA.PointsBuffer);
+	PickBuf(In.ConnBuffer, GPUResBA.ConnBuffer);
+	PickBuf(In.OffsBuffer, GPUResBA.OffsBuffer);
+	PickBuf(In.TypesBuffer, GPUResBA.TypesBuffer);
+	PickBuf(In.FeatureValsBuffer, GPUResBA.FeatureValsBuffer);
+
+	PickBuf(In.FacesBuffer, GPUResBA.FacesBuffer);
+	PickBuf(In.FaceOffsetsBuffer, GPUResBA.FaceOffsetsBuffer);
+
+	PickSRV(In.PointsSRV, GPUResBA.PointsSRV);
+	PickSRV(In.ConnSRV, GPUResBA.ConnSRV);
+	PickSRV(In.OffsSRV, GPUResBA.OffsSRV);
+	PickSRV(In.TypesSRV, GPUResBA.TypesSRV);
+	PickSRV(In.FeatureValsSRV, GPUResBA.FeatureValsSRV);
+
+	PickSRV(In.FacesSRV, GPUResBA.FacesSRV);
+	PickSRV(In.FaceOffsetsSRV, GPUResBA.FaceOffsetsSRV);
+
+	if (HasGridPack)
+	{
+		GPUResBA.NumPoints = In.NumPoints; // copie directe, 0 autorisé
+		GPUResBA.NumCells = In.NumCells;
+	}
+
+	// ---------------- OCTREE ---------------- (buffers + SRV + compteurs)
+	PickBuf(In.OctNodeCenterBuffer, GPUResBA.OctNodeCenterBuffer);
+	PickBuf(In.OctNodeExtentBuffer, GPUResBA.OctNodeExtentBuffer);
+	PickBuf(In.OctNodeFirstChildBuffer, GPUResBA.OctNodeFirstChildBuffer);
+	PickBuf(In.OctNodeChildCountBuffer, GPUResBA.OctNodeChildCountBuffer);
+	PickBuf(In.OctNodeFirstElemBuffer, GPUResBA.OctNodeFirstElemBuffer);
+	PickBuf(In.OctNodeElemCountBuffer, GPUResBA.OctNodeElemCountBuffer);
+	PickBuf(In.NodeChildIndexBuffer, GPUResBA.NodeChildIndexBuffer);
+
+	PickBuf(In.ElemMinBuffer, GPUResBA.ElemMinBuffer);
+	PickBuf(In.ElemMaxBuffer, GPUResBA.ElemMaxBuffer);
+	PickBuf(In.ElemCellBuffer, GPUResBA.ElemCellBuffer);
+
+	PickSRV(In.OctNodeCenterSRV, GPUResBA.OctNodeCenterSRV);
+	PickSRV(In.OctNodeExtentSRV, GPUResBA.OctNodeExtentSRV);
+	PickSRV(In.OctNodeFirstChildSRV, GPUResBA.OctNodeFirstChildSRV);
+	PickSRV(In.OctNodeChildCountSRV, GPUResBA.OctNodeChildCountSRV);
+	PickSRV(In.OctNodeFirstElemSRV, GPUResBA.OctNodeFirstElemSRV);
+	PickSRV(In.OctNodeElemCountSRV, GPUResBA.OctNodeElemCountSRV);
+	PickSRV(In.NodeChildIndexSRV, GPUResBA.NodeChildIndexSRV);
+
+	PickSRV(In.ElemMinSRV, GPUResBA.ElemMinSRV);
+	PickSRV(In.ElemMaxSRV, GPUResBA.ElemMaxSRV);
+	PickSRV(In.ElemCellSRV, GPUResBA.ElemCellSRV);
+
+	if (HasOctPack)
+	{
+		GPUResBA.NumNodes = In.NumNodes;     // 0 autorisé
+		GPUResBA.NumElems = In.NumElems;
+		GPUResBA.RootIndex = In.RootIndex;    //  0 autorisé
+	}
+
+	// ---------------- PARAMS additionnels ----------------
+	// Fenêtre des couleurs / usage de features / epsilon géométrique
+	UE_LOG(LogTemp, Warning, TEXT("[Raymarch]  SetVTUGPUResources : UseFeatureVals=%u VMin=%.3f VMax=%.3f Eps=%.3f"), In.UseFeatureVals, In.VMin, In.VMax, In.EpsCm);
+	if (In.bSetUseFeatureVals) GPUResBA.UseFeatureVals = In.UseFeatureVals;
+	if (In.bSetVMinMax) { GPUResBA.VMin = In.VMin; GPUResBA.VMax = In.VMax; }
+	if (In.bSetEps)            GPUResBA.EpsCm = In.EpsCm;
+
+	// Marqueur : on a désormais au moins un pack valide, le pass compute peut bind des SRV réels.
+	bHasGPUResBA = true;
 }
 
+// ------------------------------------------------------------------
+// Reset complet des ressources GPU (appelé sur RT)
+// ------------------------------------------------------------------
 void FCustomSceneViewExtension::ClearVTUGPUResources_RT()
 {
 	GPUResBA = FVTUGPUResourcesBA(); // remet tous les refs à null + compteurs à 0

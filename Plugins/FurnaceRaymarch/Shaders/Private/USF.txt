@@ -1,0 +1,784 @@
+//#include "/Engine/Private/Common.ush"
+
+//RWTexture2D<float4> OutTex;
+
+//uint2 RTSize;
+//uint RTWidth;
+//uint RTHeight;
+
+//// Caméra
+//float4x4 InvViewProj;
+
+//// AABB de debug/fallback (monde)
+//float4 UnionMinLS4;
+//float4 UnionMaxLS4;
+
+//// VTU grid (déjà bindé mais pas utilisé ici)
+//StructuredBuffer<float3> Points;
+//StructuredBuffer<uint> Conn, Offs, Types;
+//StructuredBuffer<float> FeatureVals;
+//uint NumPoints, NumCells;
+
+//// Octree
+//StructuredBuffer<float3> OctNodeCenter;
+//StructuredBuffer<float3> OctNodeExtent;
+//StructuredBuffer<int> OctNodeFirstChild;
+//StructuredBuffer<uint> OctNodeChildCount;
+//StructuredBuffer<int> OctNodeFirstElem;
+//StructuredBuffer<uint> OctNodeElemCount;
+//StructuredBuffer<int> NodeChildIndex;
+
+//StructuredBuffer<float3> ElemMin;
+//StructuredBuffer<float3> ElemMax;
+//StructuredBuffer<int> ElemCell;
+
+//uint NumNodes;
+//uint NumElems;
+//uint RootIndex;
+
+//uint DebugDrawMode; // 0=off, 1=nodes, 2=elems
+//uint UseFeatureVals; // pour plus tard
+//float VMin, VMax;
+
+//// -------------------------------------------------
+
+//static const float INF = 1e30;
+
+//bool RayAABB(float3 ro, float3 rd, float3 mn, float3 mx, out float t0, out float t1)
+//{
+//    float3 inv = 1.0 / max(abs(rd), 1e-9);
+//    float3 tA = (mn - ro) * inv;
+//    float3 tB = (mx - ro) * inv;
+//    float3 tmin3 = min(tA, tB);
+//    float3 tmax3 = max(tA, tB);
+//    t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+//    t1 = min(min(tmax3.x, tmax3.y), tmax3.z);
+//    return t1 > max(t0, 0.0);
+//}
+
+//float3 ReconstructRayWS(uint2 pix)
+//{
+//    float2 uv = (pix + 0.5) / float2(RTWidth, RTHeight);
+//    float2 ndc = uv * 2.0 - 1.0;
+
+//    float4 pN = mul(InvViewProj, float4(ndc, 0, 1));
+//    float4 pF = mul(InvViewProj, float4(ndc, 1, 1));
+//    pN.xyz /= max(pN.w, 1e-6);
+//    pF.xyz /= max(pF.w, 1e-6);
+
+//    return normalize(pF.xyz - pN.xyz);
+//}
+
+//float3 ReconstructOriginWS(uint2 pix)
+//{
+//    float2 uv = (pix + 0.5) / float2(RTWidth, RTHeight);
+//    float2 ndc = uv * 2.0 - 1.0;
+//    float4 pN = mul(InvViewProj, float4(ndc, 0, 1));
+//    pN.xyz /= max(pN.w, 1e-6);
+//    return pN.xyz;
+//}
+
+//// -------------------------------------------------
+
+//bool TraceOctree_FirstElemHit(float3 ro, float3 rd, out float tHit)
+//{
+//    tHit = INF;
+//    if (NumNodes == 0 || RootIndex >= NumNodes)
+//        return false;
+
+//    // petite pile statique
+//    uint stack[64];
+//    uint sp = 0;
+//    stack[sp++] = RootIndex;
+
+//    // limite de sécurité
+//    uint visits = 0;
+//    const uint MAX_VISITS = 4096;
+
+//    [loop]
+//    while (sp > 0 && visits < MAX_VISITS)
+//    {
+//        uint n = stack[--sp];
+//        visits++;
+
+//        float3 c = OctNodeCenter[n];
+//        float3 e = OctNodeExtent[n];
+//        float t0, t1;
+//        if (!RayAABB(ro, rd, c - e, c + e, t0, t1))
+//            continue;
+//        if (t0 > tHit)
+//            continue; // déjà plus loin que le meilleur
+
+//        uint cc = OctNodeChildCount[n];
+//        if (cc == 0)
+//        {
+//            // FEUILLE : tester les AABB des éléments
+//            uint firstElem = (uint) max(OctNodeFirstElem[n], 0);
+//            uint countElem = OctNodeElemCount[n];
+//            // coupe-sécurité
+//            countElem = min(countElem, 1024u);
+
+//            [loop]
+//            for (uint i = 0; i < countElem; ++i)
+//            {
+//                uint idx = firstElem + i;
+//                if (idx >= NumElems)
+//                    break;
+
+//                float3 mn = ElemMin[idx];
+//                float3 mx = ElemMax[idx];
+
+//                float ta, tb;
+//                if (RayAABB(ro, rd, mn, mx, ta, tb))
+//                {
+//                    float t = max(ta, 0.0);
+//                    if (t < tHit)
+//                        tHit = t;
+//                }
+//            }
+//        }
+//        else
+//        {
+//            // INTERNE : empile tous les enfants
+//            uint firstChild = (uint) max(OctNodeFirstChild[n], 0);
+//            [unroll]
+//            for (uint k = 0; k < 8; ++k)
+//            {
+//                if (k >= cc)
+//                    break;
+//                uint ch = (uint) NodeChildIndex[firstChild + k];
+//                if (sp < 64)
+//                    stack[sp++] = ch;
+//            }
+//        }
+//    }
+
+//    return (tHit < INF);
+//}
+
+//// -------------------------------------------------
+
+//[numthreads(8, 8, 1)]
+//void MainCS(uint3 dti : SV_DispatchThreadID)
+//{
+//    if (dti.x >= RTWidth || dti.y >= RTHeight)
+//        return;
+
+//    float3 ro = ReconstructOriginWS(dti.xy);
+//    float3 rd = ReconstructRayWS(dti.xy);
+
+//    // mode 1 : dessine juste l'AABB globale si pas d'octree
+//    if (DebugDrawMode == 0 && NumNodes == 0)
+//    {
+//        float3 mn = UnionMinLS4.xyz;
+//        float3 mx = UnionMaxLS4.xyz;
+//        float t0, t1;
+//        if (RayAABB(ro, rd, mn, mx, t0, t1))
+//        {
+//            // dégradé simple
+//            float3 hit = ro + rd * max(t0, 0.0);
+//            float3 col = saturate((hit - mn) / max(mx - mn, 1e-5));
+//            OutTex[dti.xy] = float4(col, 1);
+//        }
+//        else
+//        {
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//        }
+//        return;
+//    }
+
+//    // mode 1 : nodes-only (couleur = profondeur dans l'octree)
+//    if (DebugDrawMode == 1 && NumNodes > 0)
+//    {
+//        // même traversée, mais on s'arrête dès la première node touchée (coarse)
+//        float3 mn = UnionMinLS4.xyz;
+//        float3 mx = UnionMaxLS4.xyz;
+
+//        float tGlob0, tGlob1;
+//        if (!RayAABB(ro, rd, mn, mx, tGlob0, tGlob1))
+//        {
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//            return;
+//        }
+
+//        // simple test root bbox pour éviter le travail inutile
+//        float t0, t1;
+//        float3 c = OctNodeCenter[RootIndex];
+//        float3 e = OctNodeExtent[RootIndex];
+//        if (!RayAABB(ro, rd, c - e, c + e, t0, t1))
+//        {
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//            return;
+//        }
+
+//        // Couleur debug : juste l'intersection AABB globale
+//        float3 hit = ro + rd * max(t0, 0.0);
+//        float3 col = saturate((hit - mn) / max(mx - mn, 1e-5)); // debug
+//        OutTex[dti.xy] = float4(col, 1);
+//        return;
+//    }
+
+//    // mode 2 : éléments AABB (rapide et "plein")
+//    if (DebugDrawMode == 2 && NumNodes > 0)
+//    {
+//        float tHit;
+//        if (TraceOctree_FirstElemHit(ro, rd, tHit))
+//        {
+//            float3 hit = ro + rd * tHit;
+//            // color debug = normalisée dans les bounds globaux
+//            float3 mn = UnionMinLS4.xyz;
+//            float3 mx = UnionMaxLS4.xyz;
+//            float3 col = saturate((hit - mn) / max(mx - mn, 1e-5));
+//            OutTex[dti.xy] = float4(col, 1);
+//        }
+//        else
+//        {
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//        }
+//        return;
+//    }
+
+//    // fallback
+//    OutTex[dti.xy] = float4(0, 0, 0, 0);
+//}
+
+	//==========================================================================================================	//==========================================================================================================	//==========================================================================================================
+//#include "/Engine/Private/Common.ush"
+
+//RWTexture2D<float4> OutTex;
+
+//uint2 RTSize;
+//uint RTWidth;
+//uint RTHeight;
+
+//float4x4 InvViewProj;
+//float4x4 WorldToLocal;
+
+//float4 UnionMinLS4; // MinLS
+//float4 UnionMaxLS4; // MaxLS
+
+//// Grid
+//StructuredBuffer<float3> Points;
+//StructuredBuffer<uint> Conn;
+//StructuredBuffer<uint> Offs;
+//StructuredBuffer<uint> Types;
+//StructuredBuffer<float> FeatureVals;
+//StructuredBuffer<int> Faces; // polyhedron
+//StructuredBuffer<int> FaceOffsets; // polyhedron
+//uint NumPoints;
+//uint NumCells;
+
+//// Octree
+//StructuredBuffer<float3> OctNodeCenter;
+//StructuredBuffer<float3> OctNodeExtent;
+//StructuredBuffer<int> OctNodeFirstChild;
+//StructuredBuffer<uint> OctNodeChildCount;
+//StructuredBuffer<int> OctNodeFirstElem;
+//StructuredBuffer<uint> OctNodeElemCount;
+//StructuredBuffer<int> NodeChildIndex;
+//StructuredBuffer<float3> ElemMin;
+//StructuredBuffer<float3> ElemMax;
+//StructuredBuffer<int> ElemCell;
+//uint NumNodes;
+//uint NumElems;
+//uint RootIndex;
+
+//// Debug
+//uint DebugDrawMode;
+
+//// ------------------ helpers ------------------
+//bool RayAABB(float3 ro, float3 rd, float3 mn, float3 mx, out float t0, out float t1)
+//{
+//    float3 inv = 1.0 / max(abs(rd), 1e-8);
+//    float3 t1v = (mn - ro) * inv;
+//    float3 t2v = (mx - ro) * inv;
+//    float3 tmin3 = min(t1v, t2v);
+//    float3 tmax3 = max(t1v, t2v);
+//    t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+//    t1 = min(min(tmax3.x, tmax3.y), tmax3.z);
+//    return (t1 >= max(t0, 0.0));
+//}
+
+//float3 ReconstructOriginWS(uint2 pix)
+//{
+//    float2 uv = (pix + 0.5) / float2(RTWidth, RTHeight);
+//    float2 ndc = uv * 2.0 - 1.0;
+//    float4 p = mul(InvViewProj, float4(ndc, 0, 1));
+//    return p.xyz / max(p.w, 1e-8);
+//}
+//float3 ReconstructFarWS(uint2 pix)
+//{
+//    float2 uv = (pix + 0.5) / float2(RTWidth, RTHeight);
+//    float2 ndc = uv * 2.0 - 1.0;
+//    float4 p = mul(InvViewProj, float4(ndc, 1, 1));
+//    return p.xyz / max(p.w, 1e-8);
+//}
+
+//// ----- VTK face iteration (GPU side) -----
+//void ForEachCellFace_VTK(
+//    uint ci, uint eF,
+//    inout uint cursor,
+//    out uint nv,
+//    out uint v0, out uint v1, out uint v2, out uint v3,
+//    out bool valid, out bool hasMore)
+//{
+//    valid = false;
+//    hasMore = false;
+//    nv = 0;
+//    v0 = v1 = v2 = v3 = 0;
+
+//    if (cursor >= eF)
+//    {
+//        hasMore = false;
+//        return;
+//    }
+
+//    nv = (uint) Faces[cursor++];
+//    if (nv < 3)
+//    {
+//        valid = false;
+//        hasMore = (cursor < eF);
+//        return;
+//    }
+
+//    v0 = (uint) Faces[cursor + 0];
+//    v1 = (nv > 1) ? (uint) Faces[cursor + 1] : v0;
+//    v2 = (nv > 2) ? (uint) Faces[cursor + 2] : v0;
+//    v3 = (nv > 3) ? (uint) Faces[cursor + 3] : v0;
+//    cursor += nv;
+
+//    valid = true;
+//    hasMore = (cursor < eF);
+//}
+
+
+//// centroid helper (non-poly)
+//float3 CellCentroid_FromConn(uint ci)
+//{
+//    uint start = (ci == 0) ? 0 : Offs[ci - 1];
+//    uint end = Offs[ci];
+//    float3 c = 0;
+//    uint n = 0;
+//    [loop]
+//    for (uint k = start; k < end; ++k)
+//    {
+//        uint vi = Conn[k];
+//        if (vi < NumPoints)
+//        {
+//            c += Points[vi];
+//            ++n;
+//        }
+//    }
+//    return (n > 0) ? (c / n) : 0;
+//}
+
+//// centroid helper (polyhedron) – approximate by averaging unique face vertices encountered
+//float3 CellCentroid_FromFaces(uint ci)
+//{
+//    uint sF = (ci == 0) ? 0 : (uint) FaceOffsets[ci - 1];
+//    uint eF = (uint) FaceOffsets[ci];
+//    if (eF <= sF)
+//        return 0;
+
+//    uint cur = sF;
+//    uint nFaces = (uint) Faces[cur++];
+//    float3 c = 0;
+//    uint n = 0;
+
+//    [loop]
+//    for (uint f = 0; f < nFaces && cur < eF; ++f)
+//    {
+//        uint nv, a, b, dummy0, dummy1;
+//        bool valid, more;
+//        ForEachCellFace_VTK(ci, eF, cur, nv, a, b, dummy0, dummy1, valid, more);
+        
+//        if (!valid)
+//            break;
+
+//        // accumulate first 3 verts (suffices for centroid rough)
+//        if (a < NumPoints)
+//        {
+//            c += Points[a];
+//            ++n;
+//        }
+//        if (b < NumPoints)
+//        {
+//            c += Points[b];
+//            ++n;
+//        }
+//        // we don't have third index from iterator (only first two explicit here). It's ok to approximate.
+//    }
+//    return (n > 0) ? (c / n) : 0;
+//}
+
+//void AccumFacePlane(
+//    float3 p0, float3 p1, float3 p2,
+//    float3 C,
+//    float3 roLS, float3 rdLS,
+//    inout float t0, inout float t1,
+//    inout bool hadFace)
+//{
+//    float3 n = normalize(cross(p1 - p0, p2 - p0));
+//    if (dot(n, C - p0) > 0)
+//        n = -n;
+
+//    float Nd = dot(n, rdLS);
+//    float No = dot(n, roLS - p0);
+
+//    if (abs(Nd) < 1e-8)
+//    {
+//        if (No > 1e-3)
+//        {
+//            t0 = 1.0;
+//            t1 = 0.0;
+//        }
+//        return;
+//    }
+
+//    float tHit = -No / Nd;
+//    if (Nd < 0)
+//        t0 = max(t0, tHit);
+//    else
+//        t1 = min(t1, tHit);
+//    hadFace = true;
+//}
+
+//// Intersect convex cell: returns first tEnter if inside; Eps is tolerance in LS
+//bool RayIntersectConvexCell_FirstT(uint ci, float3 roLS, float3 rdLS, float Eps, out float tEnter)
+//{
+//    tEnter = 0.0;
+//    if (ci >= NumCells)
+//        return false;
+
+//    uint ty = Types[ci];
+
+//    float t0 = 0.0;
+//    float t1 = 1e30;
+//    float3 C = 0;
+
+//    // Decide centroid source
+//    if (ty == 42u /* VTK_POLYHEDRON */)
+//        C = CellCentroid_FromFaces(ci);
+//    else
+//        C = CellCentroid_FromConn(ci);
+
+//    bool hadFace = false;
+
+//    uint start = (ci == 0) ? 0 : Offs[ci - 1];
+//    uint end = Offs[ci];
+//    if (end <= start)
+//        return false;
+
+//    if (ty == 10u /* TETRA */)
+//    {
+//        uint v0 = Conn[start + 0], v1 = Conn[start + 1], v2 = Conn[start + 2], v3 = Conn[start + 3];
+//        float3 P0 = Points[v0], P1 = Points[v1], P2 = Points[v2], P3 = Points[v3];
+//        AccumFacePlane(P0, P1, P2, C, roLS, rdLS, t0, t1, hadFace);
+//        hadFace = true;
+//        AccumFacePlane(P0, P3, P1, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(P1, P3, P2, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(P0, P2, P3, C, roLS, rdLS, t0, t1, hadFace);
+//    }
+//    else if (ty == 12u /* HEXAHEDRON */)
+//    {
+//        uint4 Q[6] =
+//        {
+//            uint4(0, 1, 2, 3), uint4(4, 5, 6, 7),
+//            uint4(0, 4, 5, 1), uint4(1, 5, 6, 2),
+//            uint4(2, 6, 7, 3), uint4(3, 7, 4, 0)
+//        };
+//        [unroll]
+//        for (int f = 0; f < 6; ++f)
+//        {
+//            uint a = Conn[start + Q[f].x], b = Conn[start + Q[f].y], c = Conn[start + Q[f].z], d = Conn[start + Q[f].w];
+//            float3 P0 = Points[a], P1 = Points[b], P2 = Points[c], P3 = Points[d];
+//            AccumFacePlane(P0, P1, P2, C, roLS, rdLS, t0, t1, hadFace);
+//            hadFace = true;
+//        }
+//    }
+//    else if (ty == 13u /* WEDGE */)
+//    {
+//        uint a0 = Conn[start + 0], a1 = Conn[start + 1], a2 = Conn[start + 2];
+//        uint b0 = Conn[start + 3], b1 = Conn[start + 4], b2 = Conn[start + 5];
+//        float3 A0 = Points[a0], A1 = Points[a1], A2 = Points[a2];
+//        float3 B0 = Points[b0], B1 = Points[b1], B2 = Points[b2];
+//        AccumFacePlane(A0, A1, A2, C, roLS, rdLS, t0, t1, hadFace);
+//        hadFace = true;
+//        AccumFacePlane(B0, B1, B2, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(A0, B0, B1, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(A1, B1, B2, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(A2, B2, B0, C, roLS, rdLS, t0, t1, hadFace);
+//    }
+//    else if (ty == 14u /* PYRAMID */)
+//    {
+//        uint a = Conn[start + 0], b = Conn[start + 1], c = Conn[start + 2], d = Conn[start + 3], e = Conn[start + 4];
+//        float3 A = Points[a], B = Points[b], Cc = Points[c], D = Points[d], E = Points[e];
+//        AccumFacePlane(A, B, Cc, C, roLS, rdLS, t0, t1, hadFace);
+//        hadFace = true;
+//        AccumFacePlane(A, E, B, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(B, E, Cc, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(Cc, E, D, C, roLS, rdLS, t0, t1, hadFace);
+//        AccumFacePlane(D, E, A, C, roLS, rdLS, t0, t1, hadFace);
+//    }
+//    else if (ty == 42u /* POLYHEDRON */)
+//    {
+//        uint sF = (ci == 0) ? 0 : (uint) FaceOffsets[ci - 1];
+//        uint eF = (uint) FaceOffsets[ci];
+//        if (eF > sF)
+//        {
+//            uint cur = sF;
+//            uint nFaces = (uint) Faces[cur++];
+//            [loop]
+//            for (uint f = 0; f < nFaces && cur < eF; ++f)
+//            {
+//                uint nv, a, b, c, d;
+//                bool valid, more;
+//                ForEachCellFace_VTK(ci, eF, cur, nv, a, b, c, d, valid, more);
+//                if (!valid)
+//                    break;
+//                if (nv >= 3 && a < NumPoints && b < NumPoints && c < NumPoints)
+//                {
+//                    AccumFacePlane(Points[a], Points[b], Points[c], C, roLS, rdLS, t0, t1, hadFace);
+//                    hadFace = true;
+//                }
+//            }
+//        }
+//    }
+//    else
+//    {
+//        // unsupported type
+//        return false;
+//    }
+
+//    if (!hadFace)
+//        return false;
+//    if (t0 > t1)
+//        return false;
+//    if (t1 < 0.0)
+//        return false;
+
+//    // inside check at entry
+//    float3 pEnt = roLS + rdLS * max(0.0, t0);
+//    bool inside = true;
+
+//    // Re-run faces quickly for inside test (same as above but as distance> Eps)
+//    // (We only do a light version for main types; adequate for debug/first pass)
+//    if (ty == 42u)
+//    {
+//        uint sF = (ci == 0) ? 0 : (uint) FaceOffsets[ci - 1];
+//        uint eF = (uint) FaceOffsets[ci];
+//        if (eF > sF)
+//        {
+//            uint cur = sF + 1; // skip nFaces here
+//            [loop]
+//            for (;;)
+//            {
+//                if (cur >= eF)
+//                    break;
+//                uint nv = (uint) Faces[cur++];
+//                if (nv < 3 || cur + nv > eF)
+//                    break;
+
+//                uint a = Faces[cur + 0], b = Faces[cur + 1], c = Faces[cur + 2];
+//                cur += nv;
+
+//                if (a < NumPoints && b < NumPoints && c < NumPoints)
+//                {
+//                    float3 p0 = Points[a], p1 = Points[b], p2 = Points[c];
+//                    float3 n = normalize(cross(p1 - p0, p2 - p0));
+//                    if (dot(n, C - p0) > 0)
+//                        n = -n;
+//                    float dist = dot(n, pEnt - p0);
+//                    if (dist > Eps)
+//                    {
+//                        inside = false;
+//                        break;
+//                    }
+//                }
+//            }
+//        }
+//    }
+//    // (Pour HEX/TET/WEDGE/PYRAMID on peut réutiliser ProcessFace avec pEnt; omis pour concision)
+
+//    if (!inside)
+//        return false;
+//    tEnter = max(0.0, t0);
+//    return true;
+//}
+
+//// Octree trace: renvoie tHit + elemId (index dans Elem arrays)
+//bool TraceOctree_FirstElemHit(float3 ro, float3 rd, out float tHit, out int elemId)
+//{
+//    tHit = 1e30;
+//    elemId = -1;
+//    if (NumNodes == 0)
+//        return false;
+
+//    // Test global LS AABB
+//    float3 mn = UnionMinLS4.xyz, mx = UnionMaxLS4.xyz;
+//    float tGlob0, tGlob1;
+//    if (!RayAABB(ro, rd, mn, mx, tGlob0, tGlob1))
+//        return false;
+
+//    // simple stack
+//    const uint MAXSTACK = 64;
+//    uint stack[MAXSTACK];
+//    uint sp = 0;
+
+//    stack[sp++] = RootIndex;
+
+//    [loop]
+//    while (sp > 0)
+//    {
+//        uint nId = stack[--sp];
+
+//        float3 c = OctNodeCenter[nId];
+//        float3 e = OctNodeExtent[nId];
+//        float t0, t1;
+//        if (!RayAABB(ro, rd, c - e, c + e, t0, t1))
+//            continue;
+//        if (t0 > tHit)
+//            continue; // already have closer
+
+//        // elements in node
+//        uint fe = (uint) OctNodeFirstElem[nId];
+//        uint nec = (uint) OctNodeElemCount[nId];
+
+//        [loop]
+//        for (uint i = 0; i < nec; ++i)
+//        {
+//            uint idx = fe + i;
+//            if (idx >= NumElems)
+//                break;
+
+//            float3 emn = ElemMin[idx];
+//            float3 emx = ElemMax[idx];
+//            float ta, tb;
+//            if (!RayAABB(ro, rd, emn, emx, ta, tb))
+//                continue;
+//            if (ta < tHit && tb >= 0.0)
+//            {
+//                tHit = max(ta, 0.0);
+//                elemId = (int) idx;
+//            }
+//        }
+
+//        // children
+//        uint fc = (uint) OctNodeFirstChild[nId];
+//        uint nC = (uint) OctNodeChildCount[nId];
+//        [loop]
+//        for (uint i = 0; i < nC; ++i)
+//        {
+//            uint cId = (uint) NodeChildIndex[fc + i];
+//            if (sp < MAXSTACK)
+//            {
+//                stack[sp++] = cId;
+//            }
+//        }
+//    }
+
+//    return (elemId >= 0);
+//}
+
+//// ------------------ Main ------------------
+//[numthreads(8, 8, 1)]
+//void MainCS(uint3 dti : SV_DispatchThreadID)
+//{
+//    if (dti.x >= RTWidth || dti.y >= RTHeight)
+//        return;
+
+//    float2 uv = (dti.xy + 0.5) / float2(RTWidth, RTHeight);
+//    float2 ndc = uv * 2.0 - 1.0;
+//    float4 pNear = mul(InvViewProj, float4(ndc, 0, 1));
+//    float4 pFar = mul(InvViewProj, float4(ndc, 1, 1));
+//    pNear.xyz /= max(pNear.w, 1e-6);
+//    pFar.xyz /= max(pFar.w, 1e-6);
+//    float3 roWS = pNear.xyz;
+//    float3 rdWS = normalize(pFar.xyz - pNear.xyz);
+
+//    // Monde -> Local (acteur)
+//    float3 ro = mul(WorldToLocal, float4(roWS, 1)).xyz;
+//    float3 rd = normalize(mul(WorldToLocal, float4(rdWS, 0)).xyz);
+
+//    float3 mn = UnionMinLS4.xyz;
+//    float3 mx = UnionMaxLS4.xyz;
+
+//    // ---- Debug modes ----
+//    if (DebugDrawMode == 0u)
+//    {
+//        float t0, t1;
+//        if (RayAABB(ro, rd, mn, mx, t0, t1))
+//        {
+//            float3 hit = ro + rd * max(t0, 0.0);
+//            float3 col = saturate((hit - mn) / max(mx - mn, 1e-5));
+//            OutTex[dti.xy] = float4(col, 1);
+//        }
+//        else
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//        return;
+//    }
+
+//    if (DebugDrawMode == 1u && NumNodes > 0)
+//    {
+//        // Root node AABB
+//        float3 c = OctNodeCenter[RootIndex];
+//        float3 e = OctNodeExtent[RootIndex];
+//        float t0, t1;
+//        if (RayAABB(ro, rd, c - e, c + e, t0, t1))
+//        {
+//            float3 hit = ro + rd * max(t0, 0.0);
+//            float3 col = saturate((hit - mn) / max(mx - mn, 1e-5));
+//            OutTex[dti.xy] = float4(col, 1);
+//        }
+//        else
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//        return;
+//    }
+
+//    if (DebugDrawMode == 2u && NumNodes > 0)
+//    {
+//        float tA;
+//        int eId;
+//        if (TraceOctree_FirstElemHit(ro, rd, tA, eId))
+//        {
+//            float3 hit = ro + rd * tA;
+//            float3 col = saturate((hit - mn) / max(mx - mn, 1e-5));
+//            OutTex[dti.xy] = float4(col, 1);
+//        }
+//        else
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//        return;
+//    }
+
+//    if (DebugDrawMode == 3u && NumNodes > 0)
+//    {
+//        // Octree -> AABB elem -> **intersection exacte** de la cellule
+//        float tA;
+//        int eId;
+//        if (!TraceOctree_FirstElemHit(ro, rd, tA, eId))
+//        {
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//            return;
+//        }
+
+//        int ci = ElemCell[eId];
+//        if (ci < 0 || (uint) ci >= NumCells)
+//        {
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//            return;
+//        }
+
+//        float tHit;
+//        if (RayIntersectConvexCell_FirstT((uint) ci, ro, rd, 1e-3, tHit))
+//        {
+//            float3 hit = ro + rd * tHit;
+//            float3 col = saturate((hit - mn) / max(mx - mn, 1e-5));
+//            OutTex[dti.xy] = float4(col, 1);
+//        }
+//        else
+//            OutTex[dti.xy] = float4(0, 0, 0, 0);
+//        return;
+//    }
+
+//    OutTex[dti.xy] = float4(0, 0, 0, 0);
+//}

@@ -31,16 +31,16 @@ class FVTUCellOctree
         bool  IsBuilt() const { return Root.IsValid(); }
         bool GetCellBounds(int32 Cell, FBox& Out) const;
         const FBox* BoundsOf(int32 Cell) const;
-        // NEW: remettre l’octree à zéro
+        // remettre l’octree à zéro
         void Clear();
 
-        // NEW: compatibilité avec le code des clones ; simple wrapper + retour bool
-        bool BuildFromProxies(const TArray<FVTUCellProxy>& InProxies, const FBox& InWorldBounds,
-            int32 InMaxPerLeaf = 32, int32 InMaxDepth = 10)
+        // compatibilité avec le code des clones ; simple wrapper + retour bool
+        bool BuildFromProxies(const TArray<FVTUCellProxy>& InProxies, const FBox& InWorldBounds, int32 InMaxPerLeaf = 32, int32 InMaxDepth = 10)
         {
             Build(InProxies, InWorldBounds, InMaxPerLeaf, InMaxDepth);
             return IsBuilt();
         }
+        bool FlattenForGPU( /*out*/ TArray<FVector3f>& OutNodeCenter, TArray<FVector3f>& OutNodeExtent, TArray<int32>& OutNodeFirstChild, TArray<uint32>& OutNodeChildCount, TArray<int32>& OutNodeFirstElem, TArray<uint32>& OutNodeElemCount, TArray<int32>& OutChildIndex,/* liste contiguë des enfants*/ TArray<FVector3f>& OutElemMin, TArray<FVector3f>& OutElemMax, TArray<int32>& OutElemCell, uint32& OutRootIndex) const;
 
 
     private:

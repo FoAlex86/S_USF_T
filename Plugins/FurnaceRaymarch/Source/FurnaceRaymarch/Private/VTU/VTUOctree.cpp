@@ -1,6 +1,5 @@
 #include "VTU/VTUOctree.h"
 
-// NEW
 void FVTUCellOctree::Clear()
 {
     Root.Reset();
@@ -11,7 +10,6 @@ void FVTUCellOctree::Clear()
 
 void FVTUCellOctree::Build(const TArray<FVTUCellProxy>& InProxies, const FBox& InWorldBounds, int32 InMaxPerLeaf, int32 InMaxDepth)
 {
-    // NEW: repars propre
     Clear();
 
     Proxies = InProxies;
@@ -19,7 +17,7 @@ void FVTUCellOctree::Build(const TArray<FVTUCellProxy>& InProxies, const FBox& I
     MaxPerLeaf = FMath::Max(1, InMaxPerLeaf);
     MaxDepth = FMath::Clamp(InMaxDepth, 1, 24);
 
-    // NEW: table directe Cell -> Bounds pour accès O(1)
+    // table directe Cell -> Bounds pour accès O(1)
     int32 MaxCell = -1;
     for (const auto& P : Proxies) MaxCell = FMath::Max(MaxCell, P.Cell);
     CellBounds.SetNum(MaxCell + 1);          // (ajoute TArray<FBox> CellBounds dans la classe)
@@ -30,7 +28,7 @@ void FVTUCellOctree::Build(const TArray<FVTUCellProxy>& InProxies, const FBox& I
     {
         if (Proxies[i].Bounds.IsValid) {
             Insert(i, Root.Get(), 0);
-            // NEW: mémorise l’AABB de la cellule
+            //  mémorise l’AABB de la cellule
             const int32 c = Proxies[i].Cell;
             if (CellBounds.IsValidIndex(c)) CellBounds[c] = Proxies[i].Bounds;
         }
@@ -42,7 +40,7 @@ const FBox* FVTUCellOctree::BoundsOf(int32 Cell) const
     return (CellBounds.IsValidIndex(Cell) && CellBounds[Cell].IsValid) ? &CellBounds[Cell] : nullptr;
 }
 
-// NEW: profite de la LUT, sinon fallback (sécuritée)
+//  profite de la LUT, sinon fallback (sécuritée)
 bool FVTUCellOctree::GetCellBounds(int32 Cell, FBox& Out) const
 {
     if (CellBounds.IsValidIndex(Cell) && CellBounds[Cell].IsValid)
@@ -50,7 +48,7 @@ bool FVTUCellOctree::GetCellBounds(int32 Cell, FBox& Out) const
         Out = CellBounds[Cell];
         return true;
     }
-    // fallback (au cas où)
+    // fallback 
     for (const FVTUCellProxy& P : Proxies)
     {
         if (P.Cell == Cell) { Out = P.Bounds; return true; }
@@ -165,4 +163,106 @@ void FVTUCellOctree::QueryNodeAABB(const FVTUOctreeNode* Node, const FBox& Box, 
         for (int32 c = 0; c < 8; ++c)
             QueryNodeAABB(Node->Child[c].Get(), Box, OutCells);
     }
+}
+
+bool FVTUCellOctree::FlattenForGPU( TArray<FVector3f>& OutNodeCenter, TArray<FVector3f>& OutNodeExtent, TArray<int32>& OutNodeFirstChild, TArray<uint32>& OutNodeChildCount, TArray<int32>& OutNodeFirstElem, TArray<uint32>& OutNodeElemCount, TArray<int32>& OutChildIndex, TArray<FVector3f>& OutElemMin, TArray<FVector3f>& OutElemMax, TArray<int32>& OutElemCell, uint32& OutRootIndex) const
+{
+    if (!IsBuilt() || !Root.IsValid())
+        return false;
+
+    OutNodeCenter.Reset();
+    OutNodeExtent.Reset();
+    OutNodeFirstChild.Reset();
+    OutNodeChildCount.Reset();
+    OutNodeFirstElem.Reset();
+    OutNodeElemCount.Reset();
+    OutChildIndex.Reset();
+    OutElemMin.Reset();
+    OutElemMax.Reset();
+    OutElemCell.Reset();
+
+    // 1) numérote tous les noeuds (BFS) et stocke des pointeurs
+    TArray<const FVTUOctreeNode*> NodePtrs;
+    TMap<const FVTUOctreeNode*, int32> NodeIndex;
+    {
+        TArray<const FVTUOctreeNode*> Q;
+        Q.Add(Root.Get());
+        while (Q.Num() > 0)
+        {
+            const FVTUOctreeNode* N = Q[0]; Q.RemoveAt(0, 1, false);
+            int32 NewIdx = NodePtrs.Add(N);
+            NodeIndex.Add(N, NewIdx);
+
+            for (int32 i = 0; i < 8; ++i)
+            {
+                if (N->Child[i].IsValid())
+                    Q.Add(N->Child[i].Get());
+            }
+        }
+    }
+
+    const int32 N = NodePtrs.Num();
+    if (N <= 0) return false;
+
+    OutNodeCenter.SetNum(N);
+    OutNodeExtent.SetNum(N);
+    OutNodeFirstChild.SetNum(N);
+    OutNodeChildCount.SetNum(N);
+    OutNodeFirstElem.SetNum(N);
+    OutNodeElemCount.SetNum(N);
+
+    // 2) pour chaque noeud: bounds, enfants, éléments
+    for (int32 ni = 0; ni < N; ++ni)
+    {
+        const FVTUOctreeNode* Np = NodePtrs[ni];
+        const FBox& B = Np->Bounds;
+        const FVector3f C = (FVector3f)B.GetCenter();
+        const FVector3f E = (FVector3f)B.GetExtent();
+
+        OutNodeCenter[ni] = C;
+        OutNodeExtent[ni] = E;
+
+        // enfants -> OutChildIndex
+        int32 firstChild = -1;
+        uint32 childCount = 0;
+        for (int32 i = 0; i < 8; ++i)
+        {
+            if (Np->Child[i].IsValid())
+            {
+                const int32 cidx = NodeIndex[Np->Child[i].Get()];
+                if (firstChild < 0) firstChild = OutChildIndex.Num();
+                OutChildIndex.Add(cidx);
+                ++childCount;
+            }
+        }
+        OutNodeFirstChild[ni] = firstChild;
+        OutNodeChildCount[ni] = childCount;
+
+        // éléments (cellules) -> OutElem*
+        int32 firstElem = -1;
+        uint32 elemCount = 0;
+        if (Np->Elements.Num() > 0)
+        {
+            firstElem = OutElemCell.Num();
+            for (int32 cell : Np->Elements)
+            {
+                FBox CB;
+                if (!GetCellBounds(cell, CB))
+                {
+                    // fallback si pas de bounds par cellule
+                    const FBox* P = BoundsOf(cell);
+                    CB = P ? *P : FBox(B.Min, B.Max);
+                }
+                OutElemMin.Add((FVector3f)CB.Min);
+                OutElemMax.Add((FVector3f)CB.Max);
+                OutElemCell.Add(cell);
+                ++elemCount;
+            }
+        }
+        OutNodeFirstElem[ni] = firstElem;
+        OutNodeElemCount[ni] = elemCount;
+    }
+
+    OutRootIndex = NodeIndex[Root.Get()];
+    return true;
 }
