@@ -1517,7 +1517,8 @@ bool VTUCore::LoadNPY_CellFeatures(const FString& NpyPath, int32 NumCellsExpecte
 //------------------------------------------------------------------------------------------------Color Feature-----------------------------------------------------------------------------------------------
 // === Color map simple bleu->rouge ===
 static inline float Clamp01(float x){ return FMath::Clamp(x, 0.f, 1.f); }
-static FLinearColor ScalarToColor(float v, float vmin, float vmax)
+
+static FLinearColor ScalarToColorCore(float v, float vmin, float vmax)
 {
   if (!FMath::IsFinite(v)) return FLinearColor::Black;
   if (vmax <= vmin)        return FLinearColor::Gray;
@@ -1632,7 +1633,7 @@ bool VTUCore::BuildSurfaceToPMC_WithCellScalars(const FVTUGrid& G, UProceduralMe
 
     const int32 base = Vertices.Num();
     const float val  = CellScalars[R.Cell];
-    const FLinearColor col = ScalarToColor(val, VMin, VMax);
+    const FLinearColor col = ScalarToColorCore(val, VMin, VMax);
 
     // ajouter les sommets (dans l'ordre face)
     for (int32 idx : R.FaceVerts)

@@ -1555,26 +1555,32 @@ void AVTUViewer::PushProxyBoundsToGPU_FromRayVolumePMC()
         BoxLS.Min + Rel.GetLocation(),
         BoxLS.Max + Rel.GetLocation());
 
-    //const FVector MinLS = BoxLS.Min;
-    //const FVector MaxLS = BoxLS.Max;
+    /*const FVector MinLS = BoxLS.Min;
+    const FVector MaxLS = BoxLS.Max;*/
 
     // Matrices Local->World et World->Local de l’acteur
     const FMatrix L2W = GetActorTransform().ToMatrixWithScale();
-    const FMatrix W2L = L2W.InverseFast();
+    const FMatrix W2L = L2W.Inverse();
+    //const FMatrix W2L = L2W.InverseFast();
+
+    /*const FMatrix CompL2W = RayVolumePMC->GetComponentTransform().ToMatrixWithScale();
+    const FMatrix CompW2L = CompL2W.InverseFast();*/
 
     // Push des constantes vers le sous-système shader (côté GPU)
     if (UGameInstance* GI = GetGameInstance())
         if (UCustomShaderSubsystem* Sub = GI->GetSubsystem<UCustomShaderSubsystem>())
         {
-            //Sub->SetWorldToLocal(W2L);            // pour transformer roWS/rdWS -> LS
+            Sub->SetWorldToLocal(W2L);            // pour transformer rayOrigin/rayDirection -> LS
+            //Sub->SetWorldToLocal(CompW2L);
             //Sub->SetRaymarchBoundsLS(MinLS, MaxLS); // AABB LS du proxy
 
             // Matrice Monde -> Local de l’actor
-            Sub->SetWorldToLocal(GetActorTransform().ToMatrixWithScale().InverseFast());
+            //Sub->SetWorldToLocal(GetActorTransform().ToMatrixWithScale().InverseFast());
 
             // AABB en espace local acteur (cm) du volume dans lequel on raymarche
             Sub->SetRaymarchBoundsLS(BoxActorLS.Min, BoxActorLS.Max);
             UE_LOG(LogTemp, Warning, TEXT("  -> SetWorldToLocal + SetRaymarchBoundsLS (actor space) OK"));
+            UE_LOG(LogTemp, Warning, TEXT("  -> LS=ACTOR  Min=(%.2f,%.2f,%.2f)  Max=(%.2f,%.2f,%.2f)"), BoxActorLS.Min.X, BoxActorLS.Min.Y, BoxActorLS.Min.Z, BoxActorLS.Max.X, BoxActorLS.Max.Y, BoxActorLS.Max.Z);
         }
 }
 

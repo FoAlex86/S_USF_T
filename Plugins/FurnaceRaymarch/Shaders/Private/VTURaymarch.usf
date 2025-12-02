@@ -65,14 +65,20 @@ float3 CameraPosWS; // position caméra monde (pour alpha ou debug)
 
 // Unproject NDC (z dans [0..1]) vers World Space via InvViewProj.
 // Permet de reconstruire deux points monde (near/far) sur le rayon de pixel.
-float3 UnprojectToWorld(float2 uv, float z01)
+float3 UnprojectToWorld(float2 uv, float zClip)
 {
-    // UV viewport -> NDC
+    // UV viewport (0..1) -> NDC (-1..+1)
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0); // Y flip
-    float4 pH = float4(ndc.xy, z01, 1.0);
-    float4 wH = mul(InvViewProj, pH);
-    //float4 wH = mul(pH, InvViewProj);
-    return wH.xyz / max(wH.w, 1e-8);
+    
+    //coordonnées homogènes après projection (x,y,z,w)
+    float4 clipPosH = float4(ndc.xy, zClip, 1.0);
+    
+    // matrice inverse ViewProj pour revenir en WS
+    float4 worldPosH = mul(InvViewProj, clipPosH);
+    //float4 wH = mul(clipPosH, InvViewProj);
+    
+    // division homogène retour WS coordonnées cartésiennes
+    return worldPosH.xyz / max(worldPosH.w, 1e-8);
 }
 
 // Transforme un vecteur (pas un point) WS -> LS
@@ -89,20 +95,20 @@ float3 TransformPoint_WorldToLocal(float3 pWS)
     return pL.xyz;
 }
 
-// Ray <-> AABB (slab), en Local Space
-bool IntersectRayAABB_Slab(float3 ro, float3 rd, float3 bmin, float3 bmax, out float tmin, out float tmax)
+// Ray <-> AABB (Axis-Aligned Bounding Box), en Local Space
+bool IntersectRayAABB_Slab(float3 rayOriginLS, float3 rayDirectionLS, float3 boxMinLS, float3 boxMaxLS, out float tEnter, out float tExit)
 {
     //float3 inv = 1.0 / max(abs(rd), 1e-20).xxx * sign(rd); // éviter division par 0
-    float3 t1 = (bmin - ro) * (1.0 / rd);
-    float3 t2 = (bmax - ro) * (1.0 / rd);
+    float3 t1 = (boxMinLS - rayOriginLS) * (1.0 / rayDirectionLS);
+    float3 t2 = (boxMaxLS - rayOriginLS) * (1.0 / rayDirectionLS);
 
-    float3 tmin3 = min(t1, t2);
-    float3 tmax3 = max(t1, t2);
+    float3 tNearAxis = min(t1, t2);
+    float3 tFarAxis = max(t1, t2);
 
-    tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
-    tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
+    tEnter = max(max(tNearAxis.x, tNearAxis.y), tNearAxis.z);
+    tExit = min(min(tFarAxis.x, tFarAxis.y), tFarAxis.z);
 
-    return tmax >= max(tmin, 0.0);
+    return tExit >= max(tEnter, 0.0);
 }
 
 // Normale orientée vers l'intérieur (selon centroïde C)
@@ -557,17 +563,17 @@ bool RayIntersectConvexCell_FirstT(int ci, float3 ro, float3 rd, float eps, out 
 #define MAX_STACK 64
 
 // Raycast "first hit" en Local Space contre l’octree + cellules
-bool RaycastFirstCellLS(float3 roLS, float3 rdLS, out int outCi, out float outT)
+bool RaycastFirstCellLS(float3 rayOriginLS, float3 rayDirectionLS, out int outCi, out float outT)
 {
     outCi = -1;
     outT = 1e30;
 
     // Clip global sur l’AABB active (union LS)
-    float3 uMin = UnionMinLS4.xyz;
-    float3 uMax = UnionMaxLS4.xyz;
+    float3 boxMinLS = UnionMinLS4.xyz;
+    float3 boxMaxLS = UnionMaxLS4.xyz;
 
     float tU0, tU1;
-    if (!IntersectRayAABB_Slab(roLS, rdLS, uMin, uMax, tU0, tU1))
+    if (!IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, boxMinLS, boxMaxLS, tU0, tU1))
         return false;
 
     // Petit padding (même logique CPU) pour éviter les faux négatifs sur bords
@@ -583,7 +589,7 @@ bool RaycastFirstCellLS(float3 roLS, float3 rdLS, out int outCi, out float outT)
         float3 bmin = OctNodeCenter[RootIndex] - OctNodeExtent[RootIndex];
         float3 bmax = OctNodeCenter[RootIndex] + OctNodeExtent[RootIndex];
         float t0, t1;
-        if (IntersectRayAABB_Slab(roLS, rdLS, bmin, bmax, t0, t1))
+        if (IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, bmin, bmax, t0, t1))
         {
             stackNode[sp] = RootIndex;
             stackTN[sp] = t0;
@@ -635,7 +641,7 @@ bool RaycastFirstCellLS(float3 roLS, float3 rdLS, out int outCi, out float outT)
                 float3 ebmax = ElemMax[e] + pad;
 
                 float t0, t1;
-                if (!IntersectRayAABB_Slab(roLS, rdLS, ebmin, ebmax, t0, t1))
+                if (!IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, ebmin, ebmax, t0, t1))
                     continue;
                 if (t1 < 0.0 || t0 > outT)
                     continue;
@@ -645,7 +651,7 @@ bool RaycastFirstCellLS(float3 roLS, float3 rdLS, out int outCi, out float outT)
                     continue;
 
                 float tEnt;
-                if (RayIntersectConvexCell_FirstT(ci, roLS, rdLS, EpsCm, tEnt))
+                if (RayIntersectConvexCell_FirstT(ci, rayOriginLS, rayDirectionLS, EpsCm, tEnt))
                 {
                     if (tEnt >= 0.0 && tEnt < outT)
                     {
@@ -667,7 +673,7 @@ bool RaycastFirstCellLS(float3 roLS, float3 rdLS, out int outCi, out float outT)
                 float3 bmin = OctNodeCenter[c] - OctNodeExtent[c];
                 float3 bmax = OctNodeCenter[c] + OctNodeExtent[c];
                 float t0, t1;
-                if (IntersectRayAABB_Slab(roLS, rdLS, bmin, bmax, t0, t1))
+                if (IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, bmin, bmax, t0, t1))
                 {
                     if (t0 <= outT)
                     {
@@ -698,65 +704,65 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
     
     // Normalisation pixel -> uv [0..1] (centre de pixel)
     float2 uv = (float2(DTid.xy) + 0.5) / float2(RTSize);
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    //float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
     //--------------------------------------------------------------
-//// Deux unprojections : z=0 et z=1
-//    float4 w0 = mul(InvViewProj, float4(ndc, 0.0, 1.0));
-//    float4 w1 = mul(InvViewProj, float4(ndc, 1.0, 1.0));
-//    float3 p0 = w0.xyz / max(w0.w, 1e-8);
-//    float3 p1 = w1.xyz / max(w1.w, 1e-8);
+    //// Deux unprojections : z=0 et z=1
+    //    float4 w0 = mul(InvViewProj, float4(ndc, 0.0, 1.0));
+    //    float4 w1 = mul(InvViewProj, float4(ndc, 1.0, 1.0));
+    //    float3 p0 = w0.xyz / max(w0.w, 1e-8);
+    //    float3 p1 = w1.xyz / max(w1.w, 1e-8);
 
-//// Origine = caméra (mais direction choisie de façon robuste)
-//    float3 roWS = CameraPosWS;
-//    float d0 = distance(p0, roWS);
-//    float d1 = distance(p1, roWS);
-//    float3 rdWS = normalize((d1 > d0 ? p1 : p0) - roWS);
+    //// Origine = caméra
+    //    float3 rayOrigin = CameraPosWS;
+    //    float d0 = distance(p0, rayOrigin);
+    //    float d1 = distance(p1, rayOrigin);
+    //    float3 rayDirection = normalize((d1 > d0 ? p1 : p0) - rayOrigin);
 
-//// Passage en LOCAL + normalisation
-//    float3 roLS = TransformPoint_WorldToLocal(roWS);
-//    float3 rdLS = TransformDir_WorldToLocal(rdWS);
-//    rdLS /= max(length(rdLS), 1e-8);
+    //// Passage en LOCAL + normalisation
+    //    float3 rayOriginLS = TransformPoint_WorldToLocal(rayOrigin);
+    //    float3 rayDirectionLS = TransformDir_WorldToLocal(rayDirection);
+    //    rayDirectionLS /= max(length(rayDirectionLS), 1e-8);
     //--------------------------------------------------------------
 
     //// Reconstruction du rayon monde à partir de la caméra :
     //float3 pNearWS = UnprojectToWorld(uv, 0.0);
     //float3 pFarWS = UnprojectToWorld(uv, 1.0);
-    //float3 roWS = CameraPosWS; // origine = caméra 
-    ////float3 roWS = pNearWS;
-    //float3 rdWS = normalize(pFarWS - roWS); // direction
+    //float3 rayOrigin = CameraPosWS; // origine = caméra 
+    ////float3 rayOrigin = pNearWS;
+    //float3 rayDirection = normalize(pFarWS - rayOrigin); // direction
 
     //// Passage en LOCAL SPACE du volume
-    //float3 roLS = TransformPoint_WorldToLocal(roWS);
-    ////float3 rdLS = normalize(TransformDir_WorldToLocal(rdWS));
-    //float3 rdLS = TransformDir_WorldToLocal(rdWS);
-    //rdLS /= max(length(rdLS), 1e-8); // normalisation en LS
+    //float3 rayOriginLS = TransformPoint_WorldToLocal(rayOrigin);
+    ////float3 rayDirectionLS = normalize(TransformDir_WorldToLocal(rayDirection));
+    //float3 rayDirectionLS = TransformDir_WorldToLocal(rayDirection);
+    //rayDirectionLS /= max(length(rayDirectionLS), 1e-8); // normalisation en LS
     
     // Reconstruction du rayon monde à partir de la caméra :
     float3 pNearWS = UnprojectToWorld(uv, 0.0);
     float3 pFarWS = UnprojectToWorld(uv, 1.0);
-    //float3 roWS = CameraPosWS; // origine = caméra 
-    float3 roWS = pNearWS;
-    float3 rdWS = normalize(pFarWS - roWS); // direction
+    //float3 rayOrigin = CameraPosWS; // origine = caméra 
+    float3 rayOrigin = pNearWS;
+    float3 rayDirection = normalize(pFarWS - rayOrigin); // direction
 
     // Passage en LOCAL SPACE du volume
-    float3 roLS = TransformPoint_WorldToLocal(roWS);
-    //float3 rdLS = normalize(TransformDir_WorldToLocal(rdWS));
-    float3 rdLS = TransformDir_WorldToLocal(rdWS);
-    rdLS /= max(length(rdLS), 1e-8); // normalisation en LS
+    float3 rayOriginLS = TransformPoint_WorldToLocal(rayOrigin);
+    //float3 rayDirectionLS = normalize(TransformDir_WorldToLocal(rayDirection));
+    float3 rayDirectionLS = TransformDir_WorldToLocal(rayDirection);
+    rayDirectionLS /= max(length(rayDirectionLS), 1e-8); // normalisation en LS
     
     // ===================== ICI : BLOCS DEBUG =====================
 #if defined(RM_DEBUG) && RM_DEBUG == 1
     // 1) Test AABB union (vert si hit, transparent sinon)
-    float3 uMin = UnionMinLS4.xyz;
-    float3 uMax = UnionMaxLS4.xyz;
+    float3 boxMinLS = UnionMinLS4.xyz;
+    float3 boxMaxLS = UnionMaxLS4.xyz;
     float t0, t1;
-    bool inside = IntersectRayAABB_Slab(roLS, rdLS, uMin, uMax, t0, t1);
+    bool inside = IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, boxMinLS, boxMaxLS, t0, t1);
     OutTex[DTid.xy] = inside ? float4(0, 1, 0, 1) : float4(0, 0, 0, 0);
     return;
 #endif
     
- #if defined(RM_DEBUG) && RM_DEBUG == 2
+#if defined(RM_DEBUG) && RM_DEBUG == 2
     // 2) Validation structure octree : renvoie jaune si on touche au moins une feuille/élément AABB
     bool touched = false;
 
@@ -770,7 +776,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
         float3 bmin = OctNodeCenter[RootIndex] - OctNodeExtent[RootIndex];
         float3 bmax = OctNodeCenter[RootIndex] + OctNodeExtent[RootIndex];
         float tt0, tt1;
-        if (IntersectRayAABB_Slab(roLS, rdLS, bmin, bmax, tt0, tt1))
+        if (IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, bmin, bmax, tt0, tt1))
         { stackNode[sp]=RootIndex; stackTN[sp]=tt0; sp++; }
     }
 
@@ -802,7 +808,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
                 float3 ebmin = ElemMin[e] - pad;
                 float3 ebmax = ElemMax[e] + pad;
                 float tt0, tt1;
-                if (IntersectRayAABB_Slab(roLS, rdLS, ebmin, ebmax, tt0, tt1))
+                if (IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, ebmin, ebmax, tt0, tt1))
                 { touched = true; break; }
             }
         }
@@ -817,7 +823,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
                 float3 bmin = OctNodeCenter[c] - OctNodeExtent[c];
                 float3 bmax = OctNodeCenter[c] + OctNodeExtent[c];
                 float tt0, tt1;
-                if (IntersectRayAABB_Slab(roLS, rdLS, bmin, bmax, tt0, tt1))
+                if (IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, bmin, bmax, tt0, tt1))
                 {
                     if (sp < MAX_STACK) { stackNode[sp]=c; stackTN[sp]=tt0; sp++; }
                 }
@@ -832,7 +838,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 #if RM_DEBUG == 3
     // 3) Visualiser l’index cellule (arc-en-ciel). Vérifie la variété des ci touchés.
     int ci; float th;
-    bool ok = RaycastFirstCellLS(roLS, rdLS, ci, th);
+    bool ok = RaycastFirstCellLS(rayOriginLS, rayDirectionLS, ci, th);
     if (ok && ci >= 0 && ci < int(NumCells)) {
         float3 c = frac(float3(ci, ci*0.37, ci*0.73) * 0.013); 
         OutTex[DTid.xy] = float4(c, 1);
@@ -846,7 +852,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
     // 4) Feature en niveaux de gris + alpha profondeur normalisée.
     int ci;
     float th;
-    bool ok = RaycastFirstCellLS(roLS, rdLS, ci, th);
+    bool ok = RaycastFirstCellLS(rayOriginLS, rayDirectionLS, ci, th);
 
     float v = (ok && ci >= 0 && ci < int(NumCells)) ? FeatureVals[ci] : 0.0;
 
@@ -855,9 +861,9 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
     float L = saturate((v - VMin) / denom);
 
     // Alpha = profondeur normalisée (comme le pass final)
-    float3 uMin = UnionMinLS4.xyz;
-    float3 uMax = UnionMaxLS4.xyz;
-    float maxD = max(length(uMax - uMin), 1e-3);
+    float3 boxMinLS = UnionMinLS4.xyz;
+    float3 boxMaxLS = UnionMaxLS4.xyz;
+    float maxD = max(length(boxMaxLS - boxMinLS), 1e-3);
     float aNorm = ok ? saturate(th / maxD) : 0.0;
 
     // Option anti-NaN (si tu suspectes des données sales)
@@ -865,6 +871,104 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
     OutTex[DTid.xy] = float4(L, L, L, aNorm);
     return;
+#endif
+#if defined(RM_DEBUG) && RM_DEBUG == 5
+    // Affiche l’AABB du nœud d’octree le plus proche touché par le rayon.
+    // Aucune intersection de cellules, pas de pile : on scanne tous les nœuds.
+
+    float3 uMin = UnionMinLS4.xyz;
+    float3 uMax = UnionMaxLS4.xyz;
+
+    // Si le rayon ne touche même pas l’union, on sort (noir).
+    float u0, u1;
+    if (!IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, uMin, uMax, u0, u1))
+    {
+        OutTex[DTid.xy] = 0;
+        return;
+    }
+
+    float bestT = 1e30;
+    int bestN = -1;
+    uint maxScan = NumNodes; //limiter: min(NumNodes, 50000u)
+
+    [loop]
+    for (uint n = 0u; n < maxScan; ++n)
+    {
+        float3 bmin = OctNodeCenter[n] - OctNodeExtent[n];
+        float3 bmax = OctNodeCenter[n] + OctNodeExtent[n];
+
+        float t0, t1;
+        if (!IntersectRayAABB_Slab(rayOriginLS, rayDirectionLS, bmin, bmax, t0, t1))
+            continue;
+        if (t0 < 0.0)
+            t0 = 0.0;
+        if (t0 < bestT)
+        {
+            bestT = t0;
+            bestN = int(n);
+        }
+    }
+
+    if (bestN >= 0)
+    {
+        // Couleur: cyan pour inner, jaune pour leaf.
+        bool isLeaf = (OctNodeChildCount[bestN] == 0u);
+        float3 col = isLeaf ? float3(1, 1, 0) : float3(0, 1, 1);
+
+        // Alpha ~ profondeur normalisée dans l’union
+        float maxD = max(length(uMax - uMin), 1e-3);
+        float aNorm = saturate(bestT / maxD);
+
+        OutTex[DTid.xy] = float4(col, aNorm);
+    }
+    else
+    {
+        OutTex[DTid.xy] = 0;
+    }
+    return;
+#endif
+#if defined(RM_DEBUG) && RM_DEBUG == 6
+{
+    float3 roWS = CameraPosWS;
+    float3 rdWS = normalize(pFarWS - roWS);
+
+    float3 roLS = TransformPoint_WorldToLocal(roWS);
+    float3 rdLS = TransformDir_WorldToLocal(rdWS);
+    rdLS /= max(length(rdLS), 1e-8);
+
+    float3 uMin = min(UnionMinLS4.xyz, UnionMaxLS4.xyz);
+    float3 uMax = max(UnionMinLS4.xyz, UnionMaxLS4.xyz);
+
+    float t0, t1;
+    bool hit = IntersectRayAABB_Slab(roLS, rdLS, uMin, uMax, t0, t1);
+
+    // Alpha = profondeur normalisée dans la bbox
+    float maxD = max(length(uMax - uMin), 1e-3);
+    float a = hit ? saturate(max(0.0, t0) / maxD) : 0.0;
+
+    OutTex[DTid.xy] = hit ? float4(0,1,0, a) : float4(0,0,0,0);
+    return;
+}
+#endif
+#if defined(RM_DEBUG) && RM_DEBUG == 7
+{
+    float3 pNearWS = UnprojectToWorld(uv, 0.0);
+    float3 pFarWS  = UnprojectToWorld(uv, 1.0);
+
+    float3 roWS = CameraPosWS;
+    float3 rdWS = normalize(pFarWS - roWS);
+
+    // Affiche la direction (monde) encodée en RGB
+    float3 dirRGB = 0.5 * (normalize(rdWS) + 1.0); // [-1..1] -> [0..1]
+    OutTex[DTid.xy] = float4(dirRGB, 1.0);
+    return;
+}
+#endif
+#if defined(RM_DEBUG) && RM_DEBUG == 8
+{
+        OutTex[DTid.xy] = float4(uv, 0, 1);
+        return;
+}
 #endif
     // ================== FIN BLOCS DEBUG =========================
     
@@ -877,7 +981,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
     // Raycast
     int hitCi;
     float tHit;
-    bool hit = RaycastFirstCellLS(roLS, rdLS, hitCi, tHit);
+    bool hit = RaycastFirstCellLS(rayOriginLS, rayDirectionLS, hitCi, tHit);
 
     float4 outRGBA = float4(0, 0, 0, 0);
 
@@ -888,7 +992,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
         float3 rgb = ScalarToColorRGB(v, VMin, VMax);
 
         // Alpha = distance caméra->hit / diagonale active (identique logique CPU)
-        // Comme scale=1: distance monde ~= distance local = tHit (rdLS normalisé)
+        // Comme scale=1: distance monde ~= distance local = tHit (rayDirectionLS normalisé)
         float hitDist = tHit;
         float aNorm = saturate(hitDist / maxDepth);
 

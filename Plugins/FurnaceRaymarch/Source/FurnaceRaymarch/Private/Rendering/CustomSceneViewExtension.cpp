@@ -34,8 +34,7 @@ void FCustomSceneViewExtension::SetRaymarchTargetObject(UTextureRenderTarget2D* 
 // post-process : on prépare/dispatch le compute et on copie vers la RT.
 // C'est exécuté sur le Render Thread, dans le Render Graph.
 // ------------------------------------------------------------------
-void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
-	FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessingInputs& Inputs)
+void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessingInputs& Inputs)
 {
 	// 0) Récupère l’objet RT et sa ressource (sur le Render Thread)
 	UTextureRenderTarget2D* RTObj = RaymarchRT_Object.Get();
@@ -89,6 +88,50 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 
 	// --- Position caméra en monde : pour encoder la profondeur relative en alpha.
 	Params->CameraPosWS = (FVector3f)View.ViewMatrices.GetViewOrigin();
+
+	// --- LOG InvViewProj / sanity matrices ---*******************************************************************
+	//const FMatrix44f VP = FMatrix44f(View.ViewMatrices.GetViewProjectionMatrix());
+
+	const FMatrix44f InvVP = Params->InvViewProj;
+	const FVector3f  CamWS = Params->CameraPosWS;
+
+	// Utilitaires
+	auto MatrixHasFinite = [](const FMatrix44f& M)->bool
+	{
+		for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++)
+			if (!FMath::IsFinite(M.M[r][c])) return false;
+		return true;
+	};
+
+	auto MatToStr = [](const FMatrix44f& M)->FString
+	{
+		return FString::Printf(
+			TEXT("| %+ .6f %+ .6f %+ .6f %+ .6f |\n")
+			TEXT("| %+ .6f %+ .6f %+ .6f %+ .6f |\n")
+			TEXT("| %+ .6f %+ .6f %+ .6f %+ .6f |\n")
+			TEXT("| %+ .6f %+ .6f %+ .6f %+ .6f |"),
+			M.M[0][0], M.M[0][1], M.M[0][2], M.M[0][3],
+			M.M[1][0], M.M[1][1], M.M[1][2], M.M[1][3],
+			M.M[2][0], M.M[2][1], M.M[2][2], M.M[2][3],
+			M.M[3][0], M.M[3][1], M.M[3][2], M.M[3][3]);
+	};
+
+	// Logs
+	static uint64 LastFrameLogged = 0;
+	if (GFrameCounter - LastFrameLogged > 60) // ~1s @60fps
+	{
+		LastFrameLogged = GFrameCounter;
+
+		UE_LOG(LogTemp, Display, TEXT("[VTU] InvViewProj finite=%d det=%.6g"),
+			MatrixHasFinite(InvVP) ? 1 : 0,
+			(double)InvVP.Determinant());
+
+		UE_LOG(LogTemp, Display, TEXT("[VTU] CameraPosWS = (%.6f, %.6f, %.6f)"),
+			(double)CamWS.X, (double)CamWS.Y, (double)CamWS.Z);
+
+		UE_LOG(LogTemp, Display, TEXT("[VTU] InvViewProj:\n%s"), *MatToStr(InvVP));
+	}
+	// --- LOG InvViewProj / sanity matrices ---********************************************************************
 
 	// --- Clip plane (désactivé par défaut, champs padding à 0).
 	Params->ClipPlaneWS = FVector4f(0, 0, 0, 0);
@@ -223,9 +266,9 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 		Params->VMax = GPUResBA.VMax;
 		Params->EpsCm = GPUResBA.EpsCm;
 
-		// logs de contrôle
-		UE_LOG(LogTemp, Warning, TEXT("[Raymarch]  Octree: Nodes=%u Elems=%u Root=%u  (hasGPU=%d)"), Params->NumNodes, Params->NumElems, Params->RootIndex, bHasGPUResBA ? 1 : 0);
-		UE_LOG(LogTemp, Warning, TEXT("[Raymarch] UseFeat=%u FeatSRV=%d VMin=%.3f VMax=%.3f Eps=%.3f"), GPUResBA.UseFeatureVals, GPUResBA.FeatureValsSRV.IsValid() ? 1 : 0, GPUResBA.VMin, GPUResBA.VMax, GPUResBA.EpsCm);
+		//// logs de contrôle
+		//UE_LOG(LogTemp, Warning, TEXT("[Raymarch]  Octree: Nodes=%u Elems=%u Root=%u  (hasGPU=%d)"), Params->NumNodes, Params->NumElems, Params->RootIndex, bHasGPUResBA ? 1 : 0);
+		//UE_LOG(LogTemp, Warning, TEXT("[Raymarch] UseFeat=%u FeatSRV=%d VMin=%.3f VMax=%.3f Eps=%.3f"), GPUResBA.UseFeatureVals, GPUResBA.FeatureValsSRV.IsValid() ? 1 : 0, GPUResBA.VMin, GPUResBA.VMax, GPUResBA.EpsCm);
 	}
 
 	// 4) Récupère le shader compute global
@@ -239,9 +282,9 @@ void FCustomSceneViewExtension::PrePostProcessPass_RenderThread(
 	RDG_EVENT_SCOPE(GraphBuilder, "VTURaymarchCS");
 
 	const FVector3f Cam = (FVector3f)View.ViewMatrices.GetViewOrigin();
-	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] CamWS=(%.2f,%.2f,%.2f)  RT=%dx%d"), Cam.X, Cam.Y, Cam.Z, SizeXY.X, SizeXY.Y);
-	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] BoundsLS Min=(%.2f,%.2f,%.2f) Max=(%.2f,%.2f,%.2f)"), Params->UnionMinLS4.X, Params->UnionMinLS4.Y, Params->UnionMinLS4.Z, Params->UnionMaxLS4.X, Params->UnionMaxLS4.Y, Params->UnionMaxLS4.Z);
-	UE_LOG(LogTemp, Warning, TEXT("[Raymarch] NumPoints=%u  NumCells=%u  (hasGPU=%d)"), Params->NumPoints, Params->NumCells, bHasGPUResBA ? 1 : 0);
+	//UE_LOG(LogTemp, Warning, TEXT("[Raymarch] CamWS=(%.2f,%.2f,%.2f)  RT=%dx%d"), Cam.X, Cam.Y, Cam.Z, SizeXY.X, SizeXY.Y);
+	//UE_LOG(LogTemp, Warning, TEXT("[Raymarch] BoundsLS Min=(%.2f,%.2f,%.2f) Max=(%.2f,%.2f,%.2f)"), Params->UnionMinLS4.X, Params->UnionMinLS4.Y, Params->UnionMinLS4.Z, Params->UnionMaxLS4.X, Params->UnionMaxLS4.Y, Params->UnionMaxLS4.Z);
+	//UE_LOG(LogTemp, Warning, TEXT("[Raymarch] NumPoints=%u  NumCells=%u  (hasGPU=%d)"), Params->NumPoints, Params->NumCells, bHasGPUResBA ? 1 : 0);
 
 	// 6) Ajoute le pass compute au RDG : bind des paramètres, dispatch, unbind des UAV
 	GraphBuilder.AddPass(
